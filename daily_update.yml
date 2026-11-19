@@ -30,10 +30,9 @@ jobs:
       - name: 4. 제주 16개 관측소 스냅샷 저장 및 실측 채점
         env:
           KMA_AUTH_KEY: ${{ secrets.KMA_AUTH_KEY }}
-          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
-          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
-          ALERT_REGION: "함덕"
-        run: python app.py --auto-update
+        run: |
+          echo "KMA_AUTH_KEY length: ${#KMA_AUTH_KEY}"
+          python app.py --auto-update
 
       - name: 5. 갱신된 장부·스냅샷·감사 로그 안전 저장
         run: |
