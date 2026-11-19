@@ -16,7 +16,7 @@ import numpy as np
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# [0. 시크릿 로더 및 v8.2 공정 가중치 설정]
+# [0. 시크릿 로더 및 v8.3 공정 가중치 설정]
 # ==========================================
 def get_secret_key(key_name, default_val=""):
     val = os.environ.get(key_name, "")
@@ -54,10 +54,29 @@ WEIGHT_HISTORY_FILE = os.path.join(SAVE_DIR, "jeju_cumulative_weights_v8.json")
 AUDIT_LOG_FILE = os.path.join(SAVE_DIR, "automation_audit_log_v8.csv")
 
 _LOCK = threading.Lock()
+_KMA_RATE_LOCK = threading.Lock()
+_KMA_LAST_REQ_TS = 0.0
+_KMA_TLS = threading.local()
 _OM_SESSION = requests.Session()
 
+def _get_kma_session():
+    sess = getattr(_KMA_TLS, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        _KMA_TLS.session = sess
+    return sess
+
+def _kma_rate_wait(interval=0.2):
+    global _KMA_LAST_REQ_TS
+    with _KMA_RATE_LOCK:
+        now = time.time()
+        wait = interval - (now - _KMA_LAST_REQ_TS)
+        if wait > 0:
+            time.sleep(wait)
+        _KMA_LAST_REQ_TS = time.time()
+
 SYSTEM_HEALTH = {
-    "storage_mode": "✅ v8.2 다중좌표 일괄수집 · 스냅샷 정석 채점 · 소요시간 진단 가동 중",
+    "storage_mode": "✅ v8.3 ASOS 일괄조회 · AWS 2스레드 최적화 · 실패진단 로그 가동 중",
     "storage_path": SAVE_DIR,
     "total_error_count": 0,
     "last_check_time": "-",
@@ -73,9 +92,9 @@ SYSTEM_HEALTH = {
 
 ASOS_HUBS = {
     184: {"name": "제주",   "lat": 33.5141, "lon": 126.5297},
-    189: {"name": "서귀포", "lat": 33.2461, "lon": 126.5653},
+    185: {"name": "고산",   "lat": 33.2938, "lon": 126.1628},
     188: {"name": "성산",   "lat": 33.3868, "lon": 126.8802},
-    185: {"name": "고산",   "lat": 33.2938, "lon": 126.1628}
+    189: {"name": "서귀포", "lat": 33.2461, "lon": 126.5653}
 }
 
 JEJU_STATIONS = {
@@ -282,9 +301,6 @@ def _parse_open_meteo_hourly(res_json, req_models, now_kst):
     return df_out, loaded, max_hours
 
 def prefetch_open_meteo_batch(station_names, om_keys, past_days, now_kst, chunk_size=8):
-    """
-    Open-Meteo 공식 다중 좌표 기능(쉼표 구분 latitude/longitude)으로 16개 관측소를 2회(8곳씩)로 일괄 수집해 캐시에 적재합니다.
-    """
     t0 = time.time()
     url_om = "https://api.open-meteo.com/v1/forecast"
     cached_cnt = 0
@@ -422,7 +438,6 @@ def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst):
     if not df_all.empty:
         st_txt = "✅ 정상" if len(loaded_all) >= 8 else "⚠️ 부분복구"
         msg_txt = f"{len(loaded_all)}/{len(om_keys)}개 로드" if len(loaded_all) >= 8 else f"{len(loaded_all)}/{len(om_keys)}개 부분로드 ({last_reason})"
-        # 5개 이상 정상 수신된 경우에만 캐시 저장 (1개 임시 복구 결과 캐시 오염 방지)
         if len(loaded_all) >= 5:
             _OM_CACHE[cache_key] = {"ts": now_ts, "df": df_all, "loaded": loaded_all, "max_hours": mh_all, "status": st_txt, "msg": msg_txt, "ms": ms}
         return df_all, loaded_all, mh_all, st_txt, msg_txt, ms, False
@@ -530,7 +545,7 @@ def fetch_nasa_geos_forecast_only(lat, lon):
     return pd.DataFrame(), sec, "OpenDAP 미응답(제외)", False
 
 # ==========================================
-# [4. 기상청 6.3 지점일람표 및 관측소(1.1 AWS / ASOS) 병렬 파서]
+# [4. 기상청 ASOS 1회 일괄조회 + AWS 2스레드 최적화 & 실패사유 진단 파서]
 # ==========================================
 _DISCOVERED = False
 def auto_discover_jeju_aws_stations(auth_key):
@@ -539,9 +554,10 @@ def auto_discover_jeju_aws_stations(auth_key):
     _DISCOVERED = True
     url = "https://apihub.kma.go.kr/api/typ02/openApi/AwsYearlyInfoService/getAwsStnLstTbl"
     t0 = time.time()
+    sess = _get_kma_session()
     for yr in ["2024", "2023", "2022"]:
         try:
-            res = requests.get(url, params={"pageNo": 1, "numOfRows": 700, "dataType": "XML", "year": yr, "month": "09", "authKey": auth_key}, timeout=(3, 5))
+            res = sess.get(url, params={"pageNo": 1, "numOfRows": 700, "dataType": "XML", "year": yr, "month": "09", "authKey": auth_key}, timeout=(3, 5))
             if res.status_code == 200 and "<stn_id>" in res.text:
                 root = ET.fromstring(res.text)
                 cnt = 0
@@ -561,6 +577,95 @@ def auto_discover_jeju_aws_stations(auth_key):
             pass
 
 _OBS_CACHE = {}
+
+def _format_req_error(exc, read_sec):
+    if isinstance(exc, requests.exceptions.ReadTimeout):
+        return f"ReadTimeout({read_sec}s초과)"
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return "ConnectTimeout(5s초과)"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "ConnectionError"
+    return f"{type(exc).__name__}:{str(exc)[:25]}"
+
+def prefetch_kma_asos_batch(date_str, auth_key):
+    """
+    기상청 API허브 kma_sfctm3.php 공식 콜론(:) 다중 지점 조회로
+    제주 4개 ASOS 거점(184:185:188:189)을 단 1회 요청으로 일괄 수집해 캐시에 적재합니다.
+    """
+    if not auth_key:
+        return 0.0, 0, "기상청 API 키 미설정"
+
+    t0 = time.time()
+    hub_ids = sorted(ASOS_HUBS.keys())
+    stn_param = ":".join(str(sid) for sid in hub_ids)
+    tm1, tm2 = f"{date_str}0000", f"{date_str}2300"
+    url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfctm3.php?tm1={tm1}&tm2={tm2}&stn={stn_param}&help=0&authKey={auth_key}"
+
+    sess = _get_kma_session()
+    last_reason = "알수없음"
+
+    for attempt in range(2):
+        try:
+            res = sess.get(url, timeout=(5, 12))
+            sec = time.time() - t0
+            if res.status_code != 200:
+                last_reason = f"HTTP {res.status_code}"
+            elif "auth" in res.text.lower() and len(res.text.strip()) < 200:
+                last_reason = "인증오류(auth)"
+            else:
+                grouped = {sid: [] for sid in hub_ids}
+                for ln in res.text.split('\n'):
+                    s = ln.strip()
+                    if not s or s.startswith('#'):
+                        continue
+                    p = s.replace(',', ' ').split()
+                    if len(p) > 15 and p[0].isdigit() and len(p[0]) == 12 and p[1].isdigit():
+                        sid = int(p[1])
+                        if sid not in grouped:
+                            continue
+                        ot = pd.to_datetime(p[0], format='%Y%m%d%H%M', errors='coerce')
+                        ws = pd.to_numeric(p[3], errors='coerce')
+                        ta = pd.to_numeric(p[11], errors='coerce')
+                        rn = pd.to_numeric(p[15], errors='coerce')
+                        if pd.notnull(ot) and pd.notnull(ta) and ta > -50:
+                            grouped[sid].append({
+                                'time': ot,
+                                'obs_temp': float(ta),
+                                'obs_rain': float(rn) if (pd.notnull(rn) and rn >= 0) else 0.0,
+                                'obs_wind': float(ws) if (pd.notnull(ws) and ws >= 0) else 0.0
+                            })
+
+                ok_cnt = 0
+                with _LOCK:
+                    for sid, recs in grouped.items():
+                        if recs:
+                            dfr = pd.DataFrame(recs).drop_duplicates('time').set_index('time')
+                            msg = f"지점 {sid} (ASOS 일괄 직접 관측)"
+                            _OBS_CACHE[(sid, date_str)] = (dfr, msg)
+                            ok_cnt += 1
+                    SYSTEM_HEALTH["api_status"]["KMA ASOS (종관기상관측)"] = {
+                        "status": "✅ 정상" if ok_cnt == len(hub_ids) else "⚠️ 부분수신",
+                        "code": "200 OK", "latency_ms": int(sec * 1000),
+                        "errors": 0 if ok_cnt > 0 else 1,
+                        "msg": f"4개 거점({stn_param}) 1회 일괄수집 {ok_cnt}/{len(hub_ids)}개소"
+                    }
+                if ok_cnt > 0:
+                    return sec, ok_cnt, f"1회 일괄성공({stn_param})"
+                last_reason = "유효행 0건"
+        except Exception as e:
+            last_reason = _format_req_error(e, 12)
+
+        if attempt == 0:
+            time.sleep(1.0)
+
+    sec = time.time() - t0
+    with _LOCK:
+        SYSTEM_HEALTH["api_status"]["KMA ASOS (종관기상관측)"] = {
+            "status": "❌ 일괄실패", "code": "ERR", "latency_ms": int(sec * 1000),
+            "errors": 1, "msg": f"일괄조회 실패({last_reason})"
+        }
+    return sec, 0, last_reason
+
 def fetch_kma_obs_v8(stn_info, date_str, auth_key):
     if not auth_key:
         return pd.DataFrame(), "기상청 API 키 미설정 (Secrets에 KMA_AUTH_KEY 등록 필요)", 0.0
@@ -572,62 +677,92 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key):
             return df_c.copy(), msg_c, 0.0
 
     t0 = time.time()
+    sess = _get_kma_session()
     tm1, tm2 = f"{date_str}0000", f"{date_str}2300"
 
     if stn_info["type"] == "ASOS":
         url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfctm3.php?tm1={tm1}&tm2={tm2}&stn={stn_id}&help=0&authKey={auth_key}"
+        last_reason = "알수없음"
+        for attempt in range(2):
+            try:
+                res = sess.get(url, timeout=(5, 12))
+                sec = time.time() - t0
+                if res.status_code == 200:
+                    recs = []
+                    for ln in res.text.split('\n'):
+                        s = ln.strip()
+                        if not s or s.startswith('#'): continue
+                        p = s.replace(',', ' ').split()
+                        if len(p) > 15 and p[0].isdigit() and len(p[0]) == 12:
+                            ot = pd.to_datetime(p[0], format='%Y%m%d%H%M', errors='coerce')
+                            ws, ta, rn = pd.to_numeric(p[3], errors='coerce'), pd.to_numeric(p[11], errors='coerce'), pd.to_numeric(p[15], errors='coerce')
+                            if pd.notnull(ot) and pd.notnull(ta) and ta > -50:
+                                recs.append({'time': ot, 'obs_temp': float(ta), 'obs_rain': float(rn) if (pd.notnull(rn) and rn >= 0) else 0.0, 'obs_wind': float(ws) if (pd.notnull(ws) and ws >= 0) else 0.0})
+                    if recs:
+                        dfr = pd.DataFrame(recs).drop_duplicates('time').set_index('time')
+                        msg = f"지점 {stn_id} (ASOS 직접 관측)"
+                        with _LOCK:
+                            SYSTEM_HEALTH["api_status"]["KMA ASOS (종관기상관측)"] = {"status": "✅ 정상", "code": "200 OK", "latency_ms": int(sec * 1000), "errors": 0, "msg": f"지점 {stn_id} {len(dfr)}시간"}
+                            _OBS_CACHE[ck] = (dfr, msg)
+                        return dfr, msg, sec
+                    last_reason = "빈데이터(0건)"
+                else:
+                    last_reason = f"HTTP {res.status_code}"
+            except Exception as e:
+                last_reason = _format_req_error(e, 12)
+            if attempt == 0:
+                time.sleep(1.0)
+        return pd.DataFrame(), f"ASOS 실패({last_reason})", time.time() - t0
+
+    # AWS 1.1 매분자료: Session 재사용 + 0.2초 간격 제어 + timeout=(5, 15) + 1회 재시도 + 실패사유 기록
+    url_m = f"https://apihub.kma.go.kr/api/typ01/cgi-bin/url/nph-aws2_min?tm1={tm1}&tm2={tm2}&stn={stn_id}&disp=1&help=0&authKey={auth_key}"
+    fail_reason = "알수없음"
+
+    for attempt in range(2):
+        _kma_rate_wait(0.2)
         try:
-            res = requests.get(url, timeout=(4, 8))
+            res = sess.get(url_m, timeout=(5, 15))
             sec = time.time() - t0
-            recs = []
-            if res.status_code == 200:
+            if res.status_code != 200:
+                fail_reason = f"HTTP {res.status_code}"
+            elif "auth" in res.text.lower() and len(res.text.strip()) < 200:
+                fail_reason = "인증오류(auth)"
+            elif len(res.text.strip()) <= 40:
+                fail_reason = f"빈응답({len(res.text.strip())}B)"
+            else:
+                recs = []
                 for ln in res.text.split('\n'):
                     s = ln.strip()
                     if not s or s.startswith('#'): continue
-                    p = s.replace(',', ' ').split()
-                    if len(p) > 15 and p[0].isdigit() and len(p[0]) == 12:
+                    p = [x.strip() for x in s.replace(',', ' ').split() if x.strip()]
+                    if len(p) >= 12 and p[0].isdigit() and len(p[0]) == 12 and p[0].endswith('00'):
                         ot = pd.to_datetime(p[0], format='%Y%m%d%H%M', errors='coerce')
-                        ws, ta, rn = pd.to_numeric(p[3], errors='coerce'), pd.to_numeric(p[11], errors='coerce'), pd.to_numeric(p[15], errors='coerce')
-                        if pd.notnull(ot) and pd.notnull(ta) and ta > -50:
-                            recs.append({'time': ot, 'obs_temp': float(ta), 'obs_rain': float(rn) if (pd.notnull(rn) and rn >= 0) else 0.0, 'obs_wind': float(ws) if (pd.notnull(ws) and ws >= 0) else 0.0})
-            dfr = pd.DataFrame(recs).drop_duplicates('time').set_index('time') if recs else pd.DataFrame()
-            msg = f"지점 {stn_id} (ASOS 직접 관측)"
-            with _LOCK:
-                SYSTEM_HEALTH["api_status"]["KMA ASOS (종관기상관측)"] = {"status": "✅ 정상" if not dfr.empty else "⚠️ 빈데이터", "code": str(res.status_code), "latency_ms": int(sec * 1000), "errors": 0, "msg": f"지점 {stn_id} {len(dfr)}시간"}
-                _OBS_CACHE[ck] = (dfr, msg)
-            return dfr, msg, sec
+                        ws10, ta, rn60 = pd.to_numeric(p[7], errors='coerce'), pd.to_numeric(p[8], errors='coerce'), pd.to_numeric(p[11], errors='coerce')
+                        if pd.notnull(ot) and pd.notnull(ta) and -40 < ta < 50:
+                            recs.append({
+                                'time': ot, 'obs_temp': float(ta),
+                                'obs_rain': float(rn60) if (pd.notnull(rn60) and rn60 >= 0) else 0.0,
+                                'obs_wind': float(ws10) if (pd.notnull(ws10) and ws10 >= 0) else 0.0
+                            })
+                if recs:
+                    dfr = pd.DataFrame(recs).drop_duplicates('time').set_index('time')
+                    retry_tag = "·재시도성공" if attempt > 0 else ""
+                    msg = f"지점 {stn_id} (1.1 AWS 매분자료 직접 관측{retry_tag})"
+                    with _LOCK:
+                        SYSTEM_HEALTH["api_status"]["KMA 1.1 (AWS 매분자료)"] = {
+                            "status": "✅ 정상", "code": "200 OK", "latency_ms": int(sec * 1000),
+                            "errors": 0, "msg": f"지점 {stn_id} {len(dfr)}시간 직결{retry_tag}"
+                        }
+                        _OBS_CACHE[ck] = (dfr, msg)
+                    return dfr, msg, sec
+                fail_reason = "정시데이터없음(0건)"
         except Exception as e:
-            return pd.DataFrame(), f"ASOS 지연({str(e)[:20]})", time.time() - t0
+            fail_reason = _format_req_error(e, 15)
 
-    url_m = f"https://apihub.kma.go.kr/api/typ01/cgi-bin/url/nph-aws2_min?tm1={tm1}&tm2={tm2}&stn={stn_id}&disp=1&help=0&authKey={auth_key}"
-    try:
-        res = requests.get(url_m, timeout=(4, 8))
-        sec = time.time() - t0
-        if res.status_code == 200 and len(res.text.strip()) > 40 and "auth" not in res.text.lower():
-            recs = []
-            for ln in res.text.split('\n'):
-                s = ln.strip()
-                if not s or s.startswith('#'): continue
-                p = [x.strip() for x in s.replace(',', ' ').split() if x.strip()]
-                if len(p) >= 12 and p[0].isdigit() and len(p[0]) == 12 and p[0].endswith('00'):
-                    ot = pd.to_datetime(p[0], format='%Y%m%d%H%M', errors='coerce')
-                    ws10, ta, rn60 = pd.to_numeric(p[7], errors='coerce'), pd.to_numeric(p[8], errors='coerce'), pd.to_numeric(p[11], errors='coerce')
-                    if pd.notnull(ot) and pd.notnull(ta) and -40 < ta < 50:
-                        recs.append({
-                            'time': ot, 'obs_temp': float(ta),
-                            'obs_rain': float(rn60) if (pd.notnull(rn60) and rn60 >= 0) else 0.0,
-                            'obs_wind': float(ws10) if (pd.notnull(ws10) and ws10 >= 0) else 0.0
-                        })
-            if recs:
-                dfr = pd.DataFrame(recs).drop_duplicates('time').set_index('time')
-                msg = f"지점 {stn_id} (1.1 AWS 매분자료 직접 관측)"
-                with _LOCK:
-                    SYSTEM_HEALTH["api_status"]["KMA 1.1 (AWS 매분자료)"] = {"status": "✅ 정상", "code": "200 OK", "latency_ms": int(sec * 1000), "errors": 0, "msg": f"지점 {stn_id} {len(dfr)}시간 직결"}
-                    _OBS_CACHE[ck] = (dfr, msg)
-                return dfr, msg, sec
-    except Exception:
-        pass
+        if attempt == 0:
+            time.sleep(1.0)
 
+    # 2회 모두 실패 시 ASOS 캐시 기반 거리보간 + 실제 AWS 실패 사유 기록
     dists = sorted([(aid, h["name"], max(0.5, calc_distance_km(stn_info["lat"], stn_info["lon"], h["lat"], h["lon"]))) for aid, h in ASOS_HUBS.items()], key=lambda x: x[2])
     n1_id, n1_name, d1 = dists[0]
     n2_id, n2_name, d2 = dists[1]
@@ -637,37 +772,49 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key):
     sec = time.time() - t0
     if not df1.empty and not df2.empty:
         dfb = ((df1 * w1) + (df2 * (1.0 - w1))).dropna()
-        msg = f"거리보간({n1_name} {w1*100:.0f}%+{n2_name} {(1-w1)*100:.0f}%)"
+        msg = f"거리보간({n1_name} {w1*100:.0f}%+{n2_name} {(1-w1)*100:.0f}% | AWS실패:{fail_reason})"
         with _LOCK:
             _OBS_CACHE[ck] = (dfb, msg)
         return dfb, msg, sec
-    return pd.DataFrame(), "관측 데이터 대기", sec
+    return pd.DataFrame(), f"관측수집실패(AWS:{fail_reason})", sec
 
-def prefetch_kma_obs_batch(station_names, date_str, auth_key, max_workers=4):
-    """ASOS 4개 거점을 먼저 병렬 수집한 뒤 AWS 12개소를 병렬 수집해 캐시에 적재합니다."""
+def prefetch_kma_obs_batch(station_names, date_str, auth_key, max_workers=2):
+    """
+    1단계: ASOS 4개 거점을 1회 일괄조회(stn=184:185:188:189)
+    2단계: AWS 12개소를 max_workers=2(세션 재사용 + 0.2초 간격 + 1회 재시도)로 수집하고 실패 사유 집계
+    """
     if not auth_key:
-        return 0.0, 0
-    t0 = time.time()
-    ok_cnt = 0
-    asos_list = [n for n in station_names if JEJU_STATIONS[n]["type"] == "ASOS"]
-    aws_list = [n for n in station_names if JEJU_STATIONS[n]["type"] != "ASOS"]
+        return 0.0, 0.0, 0, 0, 0, []
 
-    for group in (asos_list, aws_list):
-        if not group:
-            continue
+    t0 = time.time()
+    asos_sec, asos_ok, asos_note = prefetch_kma_asos_batch(date_str, auth_key)
+
+    aws_list = [n for n in station_names if JEJU_STATIONS[n]["type"] != "ASOS"]
+    aws_direct_cnt, aws_interp_cnt = 0, 0
+    fail_logs = []
+
+    if aws_list:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futs = [pool.submit(fetch_kma_obs_v8, JEJU_STATIONS[n], date_str, auth_key) for n in group]
-            for f in as_completed(futs):
+            fut_map = {pool.submit(fetch_kma_obs_v8, JEJU_STATIONS[n], date_str, auth_key): n for n in aws_list}
+            for f in as_completed(fut_map):
+                reg = fut_map[f]
+                stn_id = JEJU_STATIONS[reg]["stn"]
                 try:
-                    df_r, _, _ = f.result()
-                    if not df_r.empty:
-                        ok_cnt += 1
-                except Exception:
-                    pass
-    return time.time() - t0, ok_cnt
+                    df_r, msg_r, sec_r = f.result()
+                    if not df_r.empty and "직접 관측" in msg_r:
+                        aws_direct_cnt += 1
+                    else:
+                        if not df_r.empty:
+                            aws_interp_cnt += 1
+                        fail_logs.append((reg, stn_id, round(sec_r, 2), msg_r))
+                except Exception as e:
+                    fail_logs.append((reg, stn_id, 0.0, f"스레드예외:{type(e).__name__}:{str(e)[:25]}"))
+
+    total_sec = time.time() - t0
+    return total_sec, asos_sec, asos_ok, aws_direct_cnt, aws_interp_cnt, fail_logs
 
 # ==========================================
-# [5. v8.2 공정 4중 채점 (스무딩 + 상한선 + 결측 모델 동결)]
+# [5. v8.3 공정 4중 채점 (스무딩 + 상한선 + 결측 모델 동결)]
 # ==========================================
 def evaluate_4way_fair(df_eval, candidate_models, df_obs):
     metrics = {}
@@ -763,7 +910,7 @@ def write_audit_log(region, eval_date, status, eval_mode, obs_source, scored_cnt
     row.to_csv(AUDIT_LOG_FILE, mode='a' if os.path.exists(AUDIT_LOG_FILE) else 'w', header=not os.path.exists(AUDIT_LOG_FILE), index=False, encoding='utf-8-sig')
 
 # ==========================================
-# [6. v8.2 11대 모델 통합 파이프라인 (API별 소요시간 측정 포함)]
+# [6. v8.3 11대 모델 통합 파이프라인 (API별 소요시간 측정 포함)]
 # ==========================================
 def run_station_pipeline(matched_key, progress_cb=None, log_cb=None, discover_stations=True):
     t_pipe_start = time.time()
@@ -900,7 +1047,7 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None, discover_st
         }
         top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
         write_audit_log(matched_key, yesterday_str, "v8신규초기화", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
-        weight_status_msg = f"🆕 v8.2 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점)"
+        weight_status_msg = f"🆕 v8.3 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점)"
     else:
         reg_data = history[matched_key]
         if reg_data.get("last_updated") != today_str:
@@ -1016,10 +1163,10 @@ def format_status_report():
         for reg, info in list(history.items())[:16]:
             w_map = info.get("cumulative_weights", {})
             top_m, top_w = max(w_map.items(), key=lambda x: x[1]) if w_map else ("-", 0)
-            reg_lines.append(f"• {reg}({info.get('update_count',1)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | {info.get('obs_source','-')[:22]}")
+            reg_lines.append(f"• {reg}({info.get('update_count',1)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | {info.get('obs_source','-')[:28]}")
 
     return (
-        f"🖥️ [제주 기상 앙상블 v8.2 상태 & 스냅샷 대시보드]\n"
+        f"🖥️ [제주 기상 앙상블 v8.3 상태 & 스냅샷 대시보드]\n"
         f"🕒 조회시각: {now_str} | 기상청키: {sec_kma}\n"
         f"⚖️ 가중치: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% (상한 30%)\n"
         f"📸 보관된 예보 스냅샷: {snap_txt}\n"
@@ -1039,13 +1186,23 @@ if "--auto-update" in sys.argv:
     target_stations = list(JEJU_STATIONS.keys())[:16]
     om_keys_batch = [k for k in MODELS.keys() if k != "nasa_geos_fp"]
 
-    print(f"🚀 [무인 스케줄러 v8.2] 시작 | KMA_AUTH_KEY 감지: {bool(KMA_AUTH_KEY)} (길이: {len(KMA_AUTH_KEY)}자)")
+    print(f"🚀 [무인 스케줄러 v8.3] 시작 | KMA_AUTH_KEY 감지: {bool(KMA_AUTH_KEY)} (길이: {len(KMA_AUTH_KEY)}자)")
 
     om_sec, om_ok, om_note = prefetch_open_meteo_batch(target_stations, om_keys_batch, past_days=2, now_kst=now_kst_batch, chunk_size=8)
     print(f"⏱️ [프리페치 1/2] Open-Meteo 다중좌표 일괄수집: {om_sec:.2f}s ({om_ok}/{len(target_stations)}개소 적재 | {om_note})")
 
-    kma_sec, kma_ok = prefetch_kma_obs_batch(target_stations, yesterday_str_batch, KMA_AUTH_KEY, max_workers=4)
-    print(f"⏱️ [프리페치 2/2] 기상청 어제({yesterday_str_batch}) 실측 병렬수집: {kma_sec:.2f}s ({kma_ok}/{len(target_stations)}개소 수신)")
+    kma_sec, asos_sec, asos_ok, aws_dir, aws_int, aws_fails = prefetch_kma_obs_batch(
+        target_stations, yesterday_str_batch, KMA_AUTH_KEY, max_workers=2
+    )
+    aws_total = sum(1 for n in target_stations if JEJU_STATIONS[n]["type"] != "ASOS")
+    print(
+        f"⏱️ [프리페치 2/2] 기상청 어제({yesterday_str_batch}) 실측수집: {kma_sec:.2f}s "
+        f"(ASOS 1회일괄 {asos_ok}/4개소 {asos_sec:.2f}s + AWS 직접 {aws_dir}/{aws_total} · 보간 {aws_int}/{aws_total})"
+    )
+    if aws_fails:
+        print("⚠️ [AWS 직접관측 실패 사유 진단]")
+        for f_reg, f_stn, f_sec, f_msg in aws_fails:
+            print(f"   - {f_reg}(지점 {f_stn}, {f_sec:.2f}s): {f_msg}")
 
     t_loop0 = time.time()
     for idx, reg in enumerate(target_stations, 1):
@@ -1063,7 +1220,7 @@ if "--auto-update" in sys.argv:
 
     loop_sec = time.time() - t_loop0
     total_sec = time.time() - t_all0
-    print(f"✅ [무인 스케줄러 v8.2 완료] 총 {total_sec:.2f}s (OM배치 {om_sec:.2f}s + KMA병렬 {kma_sec:.2f}s + NASA/채점 {loop_sec:.2f}s)")
+    print(f"✅ [무인 스케줄러 v8.3 완료] 총 {total_sec:.2f}s (OM배치 {om_sec:.2f}s + KMA수집 {kma_sec:.2f}s + NASA/채점 {loop_sec:.2f}s)")
     sys.exit(0)
 
 # ==========================================
@@ -1071,10 +1228,10 @@ if "--auto-update" in sys.argv:
 # ==========================================
 import streamlit as st
 
-st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v8.2", page_icon="🌴", layout="wide")
+st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v8.3", page_icon="🌴", layout="wide")
 auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
 
-st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v8.2 (고속 일괄수집 · 스냅샷 정석 채점)")
+st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v8.3 (ASOS 일괄조회 · AWS 안정화 · 스냅샷 정석 채점)")
 st.caption("가중치: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% | 스냅샷 익일 대조 · 결측 동결 · 누적 상한 30%")
 
 if not KMA_AUTH_KEY:
@@ -1101,6 +1258,8 @@ with tab_forecast:
         if run_clicked:
             _OM_CACHE.clear()
             _NASA_CACHE.clear()
+            with _LOCK:
+                _OBS_CACHE.clear()
         with st.status(f"🔄 [{selected_region} 관측소] 11대 모델 로드 · 스냅샷 검증 · 공정 채점 중...", expanded=True) as status_box:
             p_bar = st.progress(0, text="초기화 중...")
             log_box = st.empty()
@@ -1114,7 +1273,7 @@ with tab_forecast:
             st.session_state["last_region"] = selected_region
             tm = result["timings"]
             status_box.update(
-                label=f"✅ [{selected_region}] v8.2 분석 완료! (총 {tm['total']:.2f}s — OM {tm['om']:.2f}s / NASA {tm['nasa']:.2f}s / KMA {tm['kma']:.2f}s)",
+                label=f"✅ [{selected_region}] v8.3 분석 완료! (총 {tm['total']:.2f}s — OM {tm['om']:.2f}s / NASA {tm['nasa']:.2f}s / KMA {tm['kma']:.2f}s)",
                 state="complete", expanded=False
             )
 
