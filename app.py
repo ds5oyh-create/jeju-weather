@@ -362,6 +362,9 @@ def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst):
 # ==========================================
 _NASA_CACHE = {}
 
+_NASA_CACHE = {}
+_NASA_DOWN_UNTIL = 0.0
+
 def _parse_opendap_ascii_1d(ascii_text, var_name):
     vals, capture = [], False
     for line in ascii_text.split('\n'):
@@ -380,27 +383,30 @@ def _parse_opendap_ascii_1d(ascii_text, var_name):
 
 def fetch_nasa_geos_forecast_only(lat, lon):
     """
-    순수 GEOS-FP 예보(slv_Nx 기온·풍속 + flx_Nx 강수량)만 수집합니다.
-    - 관측동화 재분석(POWER) 미사용 (데이터 누수 차단)
-    - flx_Nx 강수 파일 미수신 시 0.0mm로 채우지 않고 NaN 유지 (과대평가 버그 차단)
+    - 0.25도 격자(lat_idx, lon_idx) 단위 캐시로 제주 관측소 중복 호출 제거
+    - OpenDAP 전체 무응답 시 10분 회로 차단기로 3분 이상 타임아웃 지연 방지
     """
-    ck = (round(lat, 4), round(lon, 4))
+    global _NASA_DOWN_UNTIL
+    lat_idx, lon_idx = int(round((lat + 90.0) / 0.25)), int(round((lon + 180.0) / 0.25))
+    ck = (lat_idx, lon_idx)
     now_ts = time.time()
+
     if ck in _NASA_CACHE and (now_ts - _NASA_CACHE[ck]["ts"] < 900):
         c = _NASA_CACHE[ck]
         return c["df"].copy(), c["sec"], c["note"], c["has_rain"]
+
+    if now_ts < _NASA_DOWN_UNTIL:
+        return pd.DataFrame(), 0.0, "OpenDAP 일시차단(10분 대기)", False
 
     t0 = time.time()
     session = requests.Session()
     if NASA_USER and NASA_PASS:
         session.auth = (NASA_USER, NASA_PASS)
 
-    lat_idx, lon_idx = int(round((lat + 90.0) / 0.25)), int(round((lon + 180.0) / 0.25))
     now_utc = datetime.now(timezone.utc)
     candidate_runs = [
         (now_utc, "00"),
-        (now_utc - timedelta(days=1), "12"),
-        (now_utc - timedelta(days=1), "00")
+        (now_utc - timedelta(days=1), "12")
     ]
 
     for run_dt, cyc in candidate_runs:
@@ -409,16 +415,15 @@ def fetch_nasa_geos_forecast_only(lat, lon):
         slv_u = f"{base}/tavg1_2d_slv_Nx/tavg1_2d_slv_Nx.{ymd}_{cyc}.ascii?t2m[0:1:119][{lat_idx}][{lon_idx}],u10m[0:1:119][{lat_idx}][{lon_idx}],v10m[0:1:119][{lat_idx}][{lon_idx}]"
         flx_u = f"{base}/tavg1_2d_flx_Nx/tavg1_2d_flx_Nx.{ymd}_{cyc}.ascii?prectot[0:1:119][{lat_idx}][{lon_idx}]"
         try:
-            r_s = session.get(slv_u, timeout=6)
+            r_s = session.get(slv_u, timeout=4)
             if r_s.status_code == 200 and "t2m" in r_s.text:
                 t_v = _parse_opendap_ascii_1d(r_s.text, "t2m")
                 u_v = _parse_opendap_ascii_1d(r_s.text, "u10m")
                 v_v = _parse_opendap_ascii_1d(r_s.text, "v10m")
 
-                p_v = []
-                has_rain = False
+                p_v, has_rain = [], False
                 try:
-                    r_f = session.get(flx_u, timeout=6)
+                    r_f = session.get(flx_u, timeout=4)
                     if r_f.status_code == 200 and "prectot" in r_f.text:
                         p_v = _parse_opendap_ascii_1d(r_f.text, "prectot")
                         has_rain = sum(pd.notnull(x) for x in p_v) >= 24
@@ -433,10 +438,7 @@ def fetch_nasa_geos_forecast_only(lat, lon):
                             uv = u_v[i] if i < len(u_v) and pd.notnull(u_v[i]) and abs(u_v[i]) < 200 else np.nan
                             vv = v_v[i] if i < len(v_v) and pd.notnull(v_v[i]) and abs(v_v[i]) < 200 else np.nan
                             ws_val = float(math.sqrt(uv**2 + vv**2)) if (pd.notnull(uv) and pd.notnull(vv)) else np.nan
-                            if has_rain and i < len(p_v) and pd.notnull(p_v[i]) and 0.0 <= p_v[i] < 10.0:
-                                pr_mm = float(p_v[i] * 3600.0)
-                            else:
-                                pr_mm = np.nan
+                            pr_mm = float(p_v[i] * 3600.0) if (has_rain and i < len(p_v) and pd.notnull(p_v[i]) and 0.0 <= p_v[i] < 10.0) else np.nan
                             rows.append({
                                 "time": st_kst + timedelta(hours=i),
                                 "temperature_2m_nasa_geos_fp": float(tk - 273.15),
@@ -459,9 +461,10 @@ def fetch_nasa_geos_forecast_only(lat, lon):
             continue
 
     sec = time.time() - t0
+    _NASA_DOWN_UNTIL = time.time() + 600.0
     SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (순수 예보)"] = {
         "status": "⚠️ 미수신", "code": "TIMEOUT", "latency_ms": int(sec * 1000),
-        "errors": 1, "msg": "OpenDAP 응답 지연 (임의 대체 없이 당일 제외)"
+        "errors": 1, "msg": "OpenDAP 응답 지연 (10분간 호출 생략)"
     }
     return pd.DataFrame(), sec, "OpenDAP 미응답(제외)", False
 
