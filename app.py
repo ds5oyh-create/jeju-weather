@@ -1,5 +1,6 @@
 import sys
 import os
+import glob
 import json
 import math
 import time
@@ -13,7 +14,7 @@ import numpy as np
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# [0. 시크릿 로더 및 가중치 설정 (확률 90% / 강수량 5%)]
+# [0. 시크릿 로더 및 v8.0 공정 가중치 설정]
 # ==========================================
 def get_secret_key(key_name, default_val=""):
     val = os.environ.get(key_name, "")
@@ -40,24 +41,30 @@ W_PROB = 0.90
 W_RAIN = 0.05
 W_TEMP = 0.025
 W_WIND = 0.025
-WEIGHT_RULE_VERSION = "PROB90_RAIN5_V2"
+MIN_EVAL_HOURS = 12
+DAILY_SCORE_FLOOR = 2.0
+DAILY_SCORE_CAP = 25.0
+FINAL_WEIGHT_FLOOR = 2.0
+FINAL_WEIGHT_CAP = 30.0
+WEIGHT_RULE_VERSION = "V8_SNAPSHOT_FAIR_90_5"
 
 SAVE_DIR = "./jeju_weather_data"
-os.makedirs(SAVE_DIR, exist_ok=True)
-WEIGHT_HISTORY_FILE = os.path.join(SAVE_DIR, "jeju_cumulative_weights_v7.json")
-AUDIT_LOG_FILE = os.path.join(SAVE_DIR, "automation_audit_log_v7.csv")
+SNAPSHOT_DIR = os.path.join(SAVE_DIR, "forecast_snapshots")
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+WEIGHT_HISTORY_FILE = os.path.join(SAVE_DIR, "jeju_cumulative_weights_v8.json")
+AUDIT_LOG_FILE = os.path.join(SAVE_DIR, "automation_audit_log_v8.csv")
 
 SYSTEM_HEALTH = {
-    "storage_mode": "✅ 강수확률 90% · 강수량 5% 가중치 & 11대 모델(NASA 포함) 가동 중",
+    "storage_mode": "✅ v8.0 스냅샷 정석 채점 & 공정 가중치(확률90%·강수5%) 가동 중",
     "storage_path": SAVE_DIR,
     "total_error_count": 0,
     "last_check_time": "-",
     "api_status": {
-        "Open-Meteo (10대 통합 NWP)":   {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
-        "NASA GMAO (GEOS-FP & POWER)": {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
-        "KMA 1.1 (AWS 매분자료)":       {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
-        "KMA 6.3 (AWS 지점일람표)":     {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
-        "KMA ASOS (종관기상관측)":      {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"}
+        "Open-Meteo (10대 통합 NWP)": {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
+        "NASA GEOS-FP (순수 예보)":   {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
+        "KMA 1.1 (AWS 매분자료)":     {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
+        "KMA 6.3 (AWS 지점일람표)":   {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
+        "KMA ASOS (종관기상관측)":    {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"}
     },
     "model_registry": {}
 }
@@ -103,9 +110,10 @@ MODELS = {
 }
 
 def estimate_prob_from_rain(rain_series):
-    conds = [rain_series.isna(), rain_series <= 0.0, rain_series <= 0.5, rain_series <= 2.0]
-    choices = [np.nan, 5.0, 55.0, 80.0]
-    return pd.Series(np.select(conds, choices, default=95.0), index=rain_series.index)
+    """강수확률 미제공 모델용 보수적 환산 (무강수 15% 적용으로 맑은 날 과대평가 방지, NaN은 NaN 유지)"""
+    conds = [rain_series.isna(), rain_series <= 0.0, rain_series <= 0.2, rain_series <= 1.0, rain_series <= 3.0]
+    choices = [np.nan, 15.0, 40.0, 65.0, 82.0]
+    return pd.Series(np.select(conds, choices, default=92.0), index=rain_series.index)
 
 def calc_distance_km(lat1, lon1, lat2, lon2):
     R = 6371.0
@@ -114,7 +122,127 @@ def calc_distance_km(lat1, lon1, lat2, lon2):
     return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
 # ==========================================
-# [1. Open-Meteo 3단계 자동 복구 + 15분 캐시 로더]
+# [1. 예보 스냅샷 아카이브 (저장 / 로드 / 14일 자동정리)]
+# ==========================================
+def _to_json_list(series):
+    return [None if pd.isna(v) else round(float(v), 2) for v in series]
+
+def prune_old_snapshots(keep_days=14):
+    cutoff = (datetime.now(KST).date() - timedelta(days=keep_days)).strftime("%Y%m%d")
+    for fp in glob.glob(os.path.join(SNAPSHOT_DIR, "snapshots_*.json")):
+        fname = os.path.basename(fp)
+        ymd = fname.replace("snapshots_", "").replace(".json", "")
+        if ymd.isdigit() and ymd < cutoff:
+            try:
+                os.remove(fp)
+            except Exception:
+                pass
+
+def save_forecast_snapshot(region_name, today_date, now_kst, df_mod, active_models):
+    """오늘 최초 실행 시 오늘~내일(48시간) 예보 원본을 JSON 스냅샷으로 고정 저장 (당일 덮어쓰기 금지)"""
+    if df_mod.empty or not active_models:
+        return False
+    ymd = today_date.strftime("%Y%m%d")
+    snap_path = os.path.join(SNAPSHOT_DIR, f"snapshots_{ymd}.json")
+
+    snap_db = {}
+    if os.path.exists(snap_path):
+        try:
+            with open(snap_path, "r", encoding="utf-8") as f:
+                snap_db = json.load(f)
+        except Exception:
+            snap_db = {}
+
+    # 이미 오늘 스냅샷이 저장된 지역이면 덮어쓰지 않음 (아침 원형 예보 보존)
+    if region_name in snap_db:
+        return False
+
+    start_ts = pd.Timestamp(today_date)
+    end_ts = start_ts + pd.Timedelta(hours=71)
+    df_win = df_mod[(df_mod.index >= start_ts) & (df_mod.index <= end_ts)]
+    if df_win.empty:
+        return False
+
+    model_payload = {}
+    for mc in active_models.keys():
+        t_c, p_c, pr_c, w_c = f"temperature_2m_{mc}", f"precipitation_{mc}", f"precipitation_probability_{mc}", f"wind_speed_10m_{mc}"
+        if all(c in df_win.columns for c in [t_c, p_c, pr_c, w_c]):
+            model_payload[mc] = {
+                "t": _to_json_list(df_win[t_c]),
+                "p": _to_json_list(df_win[p_c]),
+                "pr": _to_json_list(df_win[pr_c]),
+                "w": _to_json_list(df_win[w_c])
+            }
+
+    if not model_payload:
+        return False
+
+    snap_db[region_name] = {
+        "saved_at": now_kst.strftime("%Y-%m-%d %H:%M"),
+        "times": [ts.strftime("%Y-%m-%d %H:%M") for ts in df_win.index],
+        "models": model_payload
+    }
+    with open(snap_path, "w", encoding="utf-8") as f:
+        json.dump(snap_db, f, ensure_ascii=False, separators=(',', ':'))
+    prune_old_snapshots(14)
+    return True
+
+def load_yesterday_snapshot(region_name, yesterday_date):
+    """
+    어제 날짜(yesterday_date)의 정석 채점용 스냅샷을 탐색합니다.
+    1순위: 그제 저장된 스냅샷 (진짜 24시간 전 발표 예보)
+    2순위: 어제 새벽 저장된 스냅샷 (당일 아침 발표 예보)
+    """
+    y_start = pd.Timestamp(yesterday_date)
+    y_end = y_start + pd.Timedelta(hours=23)
+    candidates = [
+        (yesterday_date - timedelta(days=1), "전일 발표 24h 리드타임"),
+        (yesterday_date, "당일 새벽 발표")
+    ]
+
+    for c_date, lead_label in candidates:
+        ymd = c_date.strftime("%Y%m%d")
+        snap_path = os.path.join(SNAPSHOT_DIR, f"snapshots_{ymd}.json")
+        if not os.path.exists(snap_path):
+            continue
+        try:
+            with open(snap_path, "r", encoding="utf-8") as f:
+                snap_db = json.load(f)
+            if region_name not in snap_db:
+                continue
+            entry = snap_db[region_name]
+            idx = pd.to_datetime(entry["times"])
+            data_cols = {}
+            for mc, md in entry["models"].items():
+                data_cols[f"temperature_2m_{mc}"] = pd.to_numeric(md["t"], errors='coerce')
+                data_cols[f"precipitation_{mc}"] = pd.to_numeric(md["p"], errors='coerce')
+                data_cols[f"precipitation_probability_{mc}"] = pd.to_numeric(md["pr"], errors='coerce')
+                data_cols[f"wind_speed_10m_{mc}"] = pd.to_numeric(md["w"], errors='coerce')
+            df_snap = pd.DataFrame(data_cols, index=idx)
+            df_y = df_snap[(df_snap.index >= y_start) & (df_snap.index <= y_end)]
+            if len(df_y) >= MIN_EVAL_HOURS:
+                saved_at = entry.get("saved_at", ymd)
+                return df_y, f"📸 스냅샷 정석 채점 ({lead_label}, 저장시각 {saved_at})"
+        except Exception:
+            continue
+
+    return pd.DataFrame(), "⏳ 스냅샷 미축적 (임시 Open-Meteo 단기치 채점 · 내일부터 정석 전환)"
+
+def list_saved_snapshots():
+    files = sorted(glob.glob(os.path.join(SNAPSHOT_DIR, "snapshots_*.json")), reverse=True)
+    summary = []
+    for fp in files[:7]:
+        ymd = os.path.basename(fp).replace("snapshots_", "").replace(".json", "")
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                db = json.load(f)
+            summary.append(f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]} ({len(db)}개 지역)")
+        except Exception:
+            pass
+    return summary
+
+# ==========================================
+# [2. Open-Meteo 3단계 자동 복구 + 15분 캐시 로더]
 # ==========================================
 _OM_CACHE = {}
 
@@ -124,8 +252,7 @@ def _parse_open_meteo_hourly(res_json, req_models, now_kst):
     df_raw.set_index('time', inplace=True)
 
     df_out = pd.DataFrame(index=df_raw.index)
-    loaded = {}
-    max_hours = {}
+    loaded, max_hours = {}, {}
 
     for mc in req_models:
         t_c = f"temperature_2m_{mc}" if f"temperature_2m_{mc}" in df_raw.columns else ("temperature_2m" if len(req_models) == 1 and "temperature_2m" in df_raw.columns else None)
@@ -137,15 +264,15 @@ def _parse_open_meteo_hourly(res_json, req_models, now_kst):
 
         out_t, out_p, out_pr, out_w = f"temperature_2m_{mc}", f"precipitation_{mc}", f"precipitation_probability_{mc}", f"wind_speed_10m_{mc}"
         s_t = pd.to_numeric(df_raw[t_c], errors='coerce').interpolate(method='linear', limit=2)
-        s_p = pd.to_numeric(df_raw[p_c], errors='coerce').fillna(0.0) if p_c else pd.Series(0.0, index=df_raw.index)
-        s_w = pd.to_numeric(df_raw[w_c], errors='coerce').interpolate(method='linear', limit=2).fillna(0.0) if w_c else pd.Series(0.0, index=df_raw.index)
+        s_p = pd.to_numeric(df_raw[p_c], errors='coerce') if p_c else pd.Series(np.nan, index=df_raw.index)
+        s_w = pd.to_numeric(df_raw[w_c], errors='coerce').interpolate(method='linear', limit=2) if w_c else pd.Series(np.nan, index=df_raw.index)
 
         if pr_c and pd.to_numeric(df_raw[pr_c], errors='coerce').notna().sum() >= 10:
             s_pr = pd.to_numeric(df_raw[pr_c], errors='coerce')
             prob_info = "자체확률"
         else:
             s_pr = estimate_prob_from_rain(s_p)
-            prob_info = "강수환산확률"
+            prob_info = "강수환산"
 
         valid_h = int(s_t[s_t.index >= now_kst].notna().sum())
         if valid_h >= 12:
@@ -199,15 +326,12 @@ def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst):
     df_all = pd.DataFrame()
     loaded_all, mh_all = {}, {}
 
-    # 1차 시도: 10개 모델 일괄 요청
     data_full = _call_batch(om_keys)
     if data_full:
         df_all, loaded_all, mh_all = _parse_open_meteo_hourly(data_full, om_keys, now_kst)
     else:
-        # 2차 시도: 5개씩 2묶음 분할 요청 (일부 모델 오류/페이로드 제한 우회)
-        chunks = [om_keys[:5], om_keys[5:]]
         parts = []
-        for ch in chunks:
+        for ch in [om_keys[:5], om_keys[5:]]:
             time.sleep(0.5)
             d_ch = _call_batch(ch)
             if d_ch:
@@ -219,7 +343,6 @@ def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst):
         if parts:
             df_all = pd.concat(parts, axis=1)
 
-    # 3차 최후 안전망: 기본 통합 모델(best_match) 호출
     if df_all.empty:
         d_bm = _call_batch(None)
         if d_bm:
@@ -235,8 +358,10 @@ def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst):
     return pd.DataFrame(), {}, {}, "❌ 통신실패", f"HTTP {last_code}: {last_reason}", ms
 
 # ==========================================
-# [2. NASA GEOS-FP & NASA POWER 통합 수집]
+# [3. NASA GEOS-FP 순수 예보 전용 수집기 (결측 NaN 유지 · 재분석/GFS복사 제거)]
 # ==========================================
+_NASA_CACHE = {}
+
 def _parse_opendap_ascii_1d(ascii_text, var_name):
     vals, capture = [], False
     for line in ascii_text.split('\n'):
@@ -250,103 +375,98 @@ def _parse_opendap_ascii_1d(ascii_text, var_name):
             parts = [p.strip() for p in s.split(',')]
             if len(parts) >= 2 and parts[0].startswith('['):
                 v = pd.to_numeric(parts[1], errors='coerce')
-                if pd.notnull(v): vals.append(float(v))
+                vals.append(float(v) if pd.notnull(v) else np.nan)
     return vals
 
-def fetch_nasa_geos_model(lat, lon, past_days, now_kst):
+def fetch_nasa_geos_forecast_only(lat, lon):
+    """
+    순수 GEOS-FP 예보(slv_Nx 기온·풍속 + flx_Nx 강수량)만 수집합니다.
+    - 관측동화 재분석(POWER) 미사용 (데이터 누수 차단)
+    - flx_Nx 강수 파일 미수신 시 0.0mm로 채우지 않고 NaN 유지 (과대평가 버그 차단)
+    """
+    ck = (round(lat, 4), round(lon, 4))
+    now_ts = time.time()
+    if ck in _NASA_CACHE and (now_ts - _NASA_CACHE[ck]["ts"] < 900):
+        c = _NASA_CACHE[ck]
+        return c["df"].copy(), c["sec"], c["note"], c["has_rain"]
+
     t0 = time.time()
     session = requests.Session()
     if NASA_USER and NASA_PASS:
         session.auth = (NASA_USER, NASA_PASS)
-    df_parts, notes = [], []
-
-    try:
-        start_d = (now_kst - timedelta(days=max(3, past_days + 1))).strftime("%Y%m%d")
-        end_d = now_kst.strftime("%Y%m%d")
-        pw_url = (
-            f"https://power.larc.nasa.gov/api/temporal/hourly/point"
-            f"?parameters=T2M,PRECTOTCORR,WS10M&community=RE"
-            f"&longitude={lon}&latitude={lat}&start={start_d}&end={end_d}&format=JSON&time-standard=UTC"
-        )
-        r_pw = session.get(pw_url, timeout=6)
-        if r_pw.status_code == 200:
-            p_data = r_pw.json().get("properties", {}).get("parameter", {})
-            t2m_d, pr_d, ws_d = p_data.get("T2M", {}), p_data.get("PRECTOTCORR", {}), p_data.get("WS10M", {})
-            rows = []
-            for dt_s, tv in t2m_d.items():
-                if tv > -90:
-                    tkst = pd.to_datetime(dt_s, format="%Y%m%d%H", errors='coerce') + pd.Timedelta(hours=9)
-                    pv, wv = pr_d.get(dt_s, 0.0), ws_d.get(dt_s, 3.0)
-                    rows.append({
-                        "time": tkst,
-                        "temperature_2m_nasa_geos_fp": float(tv),
-                        "precipitation_nasa_geos_fp": max(0.0, float(pv) if pv > -90 else 0.0),
-                        "wind_speed_10m_nasa_geos_fp": max(0.0, float(wv) if wv > -90 else 3.0)
-                    })
-            if rows:
-                df_parts.append(pd.DataFrame(rows).set_index("time"))
-                notes.append("GMAO-POWER")
-    except Exception:
-        pass
 
     lat_idx, lon_idx = int(round((lat + 90.0) / 0.25)), int(round((lon + 180.0) / 0.25))
     now_utc = datetime.now(timezone.utc)
-    for run_dt, cyc in [(now_utc, "00"), (now_utc - timedelta(days=1), "12"), (now_utc - timedelta(days=1), "00")]:
+    candidate_runs = [
+        (now_utc, "00"),
+        (now_utc - timedelta(days=1), "12"),
+        (now_utc - timedelta(days=1), "00")
+    ]
+
+    for run_dt, cyc in candidate_runs:
         ymd = run_dt.strftime("%Y%m%d")
         base = "https://opendap.nccs.nasa.gov/dods/GEOS-5/fp/0.25_deg/fcast"
         slv_u = f"{base}/tavg1_2d_slv_Nx/tavg1_2d_slv_Nx.{ymd}_{cyc}.ascii?t2m[0:1:119][{lat_idx}][{lon_idx}],u10m[0:1:119][{lat_idx}][{lon_idx}],v10m[0:1:119][{lat_idx}][{lon_idx}]"
         flx_u = f"{base}/tavg1_2d_flx_Nx/tavg1_2d_flx_Nx.{ymd}_{cyc}.ascii?prectot[0:1:119][{lat_idx}][{lon_idx}]"
         try:
-            r_s = session.get(slv_u, timeout=4)
+            r_s = session.get(slv_u, timeout=6)
             if r_s.status_code == 200 and "t2m" in r_s.text:
                 t_v = _parse_opendap_ascii_1d(r_s.text, "t2m")
                 u_v = _parse_opendap_ascii_1d(r_s.text, "u10m")
                 v_v = _parse_opendap_ascii_1d(r_s.text, "v10m")
+
                 p_v = []
+                has_rain = False
                 try:
-                    r_f = session.get(flx_u, timeout=4)
+                    r_f = session.get(flx_u, timeout=6)
                     if r_f.status_code == 200 and "prectot" in r_f.text:
                         p_v = _parse_opendap_ascii_1d(r_f.text, "prectot")
+                        has_rain = sum(pd.notnull(x) for x in p_v) >= 24
                 except Exception:
-                    pass
-                if len(t_v) >= 24:
+                    has_rain = False
+
+                if sum(pd.notnull(x) for x in t_v) >= 24:
                     st_kst = (datetime.strptime(f"{ymd}{cyc}", "%Y%m%d%H") + timedelta(hours=9)).replace(minute=0, second=0)
-                    rows_f = []
+                    rows = []
                     for i, tk in enumerate(t_v):
-                        if 180.0 < tk < 340.0:
-                            uv = u_v[i] if i < len(u_v) and abs(u_v[i]) < 200 else 2.0
-                            vv = v_v[i] if i < len(v_v) and abs(v_v[i]) < 200 else 2.0
-                            pr = p_v[i] if i < len(p_v) and 0 <= p_v[i] < 10 else 0.0
-                            rows_f.append({
+                        if pd.notnull(tk) and 180.0 < tk < 340.0:
+                            uv = u_v[i] if i < len(u_v) and pd.notnull(u_v[i]) and abs(u_v[i]) < 200 else np.nan
+                            vv = v_v[i] if i < len(v_v) and pd.notnull(v_v[i]) and abs(v_v[i]) < 200 else np.nan
+                            ws_val = float(math.sqrt(uv**2 + vv**2)) if (pd.notnull(uv) and pd.notnull(vv)) else np.nan
+                            if has_rain and i < len(p_v) and pd.notnull(p_v[i]) and 0.0 <= p_v[i] < 10.0:
+                                pr_mm = float(p_v[i] * 3600.0)
+                            else:
+                                pr_mm = np.nan
+                            rows.append({
                                 "time": st_kst + timedelta(hours=i),
                                 "temperature_2m_nasa_geos_fp": float(tk - 273.15),
-                                "precipitation_nasa_geos_fp": float(pr * 3600.0),
-                                "wind_speed_10m_nasa_geos_fp": float(math.sqrt(uv**2 + vv**2))
+                                "precipitation_nasa_geos_fp": pr_mm,
+                                "wind_speed_10m_nasa_geos_fp": ws_val
                             })
-                    if rows_f:
-                        df_parts.append(pd.DataFrame(rows_f).set_index("time"))
-                        notes.append(f"GEOS-FP({ymd}_{cyc})")
-                        break
+                    if rows:
+                        df_fc = pd.DataFrame(rows).set_index("time")
+                        df_fc["precipitation_probability_nasa_geos_fp"] = estimate_prob_from_rain(df_fc["precipitation_nasa_geos_fp"])
+                        sec = time.time() - t0
+                        note = f"GEOS-FP({ymd}_{cyc}Z, 강수{'정상' if has_rain else '미수신-NaN유지'})"
+                        SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (순수 예보)"] = {
+                            "status": "✅ 정상" if has_rain else "⚠️ 강수누락",
+                            "code": "200 OK", "latency_ms": int(sec * 1000),
+                            "errors": 0 if has_rain else 1, "msg": note
+                        }
+                        _NASA_CACHE[ck] = {"ts": now_ts, "df": df_fc, "sec": sec, "note": note, "has_rain": has_rain}
+                        return df_fc, sec, note, has_rain
         except Exception:
             continue
 
-    ms = int((time.time() - t0) * 1000)
-    if df_parts:
-        dfc = pd.concat(df_parts).sort_index()
-        dfc = dfc[~dfc.index.duplicated(keep='last')]
-        dfc["precipitation_probability_nasa_geos_fp"] = estimate_prob_from_rain(dfc["precipitation_nasa_geos_fp"])
-        SYSTEM_HEALTH["api_status"]["NASA GMAO (GEOS-FP & POWER)"] = {
-            "status": "✅ 정상", "code": "200 OK", "latency_ms": ms, "errors": 0, "msg": f"NASA 연동 ({'+'.join(notes)})"
-        }
-        return dfc, ms / 1000.0, "+".join(notes)
-
-    SYSTEM_HEALTH["api_status"]["NASA GMAO (GEOS-FP & POWER)"] = {
-        "status": "⚠️ 지연", "code": "PASS", "latency_ms": ms, "errors": 0, "msg": "NASA 서버 응답 지연"
+    sec = time.time() - t0
+    SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (순수 예보)"] = {
+        "status": "⚠️ 미수신", "code": "TIMEOUT", "latency_ms": int(sec * 1000),
+        "errors": 1, "msg": "OpenDAP 응답 지연 (임의 대체 없이 당일 제외)"
     }
-    return pd.DataFrame(), ms / 1000.0, "보조동화"
+    return pd.DataFrame(), sec, "OpenDAP 미응답(제외)", False
 
 # ==========================================
-# [3. 기상청 6.3 지점일람표 및 관측소(1.1 AWS / ASOS) 파서]
+# [4. 기상청 6.3 지점일람표 및 관측소(1.1 AWS / ASOS) 파서]
 # ==========================================
 _DISCOVERED = False
 def auto_discover_jeju_aws_stations(auth_key):
@@ -377,7 +497,7 @@ def auto_discover_jeju_aws_stations(auth_key):
             pass
 
 _OBS_CACHE = {}
-def fetch_kma_obs_v7(stn_info, date_str, auth_key):
+def fetch_kma_obs_v8(stn_info, date_str, auth_key):
     if not auth_key:
         return pd.DataFrame(), "기상청 API 키 미설정 (Secrets에 KMA_AUTH_KEY 등록 필요)"
     stn_id = stn_info["stn"]
@@ -441,8 +561,8 @@ def fetch_kma_obs_v7(stn_info, date_str, auth_key):
     n1_id, n1_name, d1 = dists[0]
     n2_id, n2_name, d2 = dists[1]
     w1 = (1.0 / d1) / ((1.0 / d1) + (1.0 / d2))
-    df1, _ = fetch_kma_obs_v7({"stn": n1_id, "type": "ASOS"}, date_str, auth_key)
-    df2, _ = fetch_kma_obs_v7({"stn": n2_id, "type": "ASOS"}, date_str, auth_key)
+    df1, _ = fetch_kma_obs_v8({"stn": n1_id, "type": "ASOS"}, date_str, auth_key)
+    df2, _ = fetch_kma_obs_v8({"stn": n2_id, "type": "ASOS"}, date_str, auth_key)
     if not df1.empty and not df2.empty:
         dfb = ((df1 * w1) + (df2 * (1.0 - w1))).dropna()
         _OBS_CACHE[ck] = (dfb, f"거리보간({n1_name} {w1*100:.0f}%+{n2_name} {(1-w1)*100:.0f}%)")
@@ -450,15 +570,21 @@ def fetch_kma_obs_v7(stn_info, date_str, auth_key):
     return pd.DataFrame(), "관측 데이터 대기"
 
 # ==========================================
-# [4. 4중 오차 채점 (강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5%)]
+# [5. v8.0 공정 4중 채점 (스무딩 + 상한선 + 결측 모델 동결)]
 # ==========================================
-def evaluate_4way_detailed(df_mod, active_models, df_obs):
+def evaluate_4way_fair(df_eval, candidate_models, df_obs):
+    """
+    - 유효 대조 시간 12시간 이상인 모델만 정식 채점 (결측 모델은 scored=False로 기존 가중치 동결)
+    - 스무딩 상수(+0.12)와 일일 점유율 상한(25%)으로 맑은 날 Brier Score 폭등 차단
+    """
     metrics = {}
-    for m_code in active_models.keys():
+    scored_keys = []
+
+    for m_code in candidate_models:
         t_c, p_c, pr_c, w_c = f"temperature_2m_{m_code}", f"precipitation_{m_code}", f"precipitation_probability_{m_code}", f"wind_speed_10m_{m_code}"
-        if not df_obs.empty and not df_mod.empty and all(c in df_mod.columns for c in [t_c, p_c, pr_c, w_c]):
-            df_pair = pd.concat([df_mod[[t_c, p_c, pr_c, w_c]], df_obs[['obs_temp', 'obs_rain', 'obs_wind']]], axis=1).dropna()
-            if len(df_pair) >= 3:
+        if not df_obs.empty and not df_eval.empty and all(c in df_eval.columns for c in [t_c, p_c, pr_c, w_c]):
+            df_pair = pd.concat([df_eval[[t_c, p_c, pr_c, w_c]], df_obs[['obs_temp', 'obs_rain', 'obs_wind']]], axis=1).dropna()
+            if len(df_pair) >= MIN_EVAL_HOURS:
                 t_bias = float(np.mean(df_pair[t_c] - df_pair['obs_temp']))
                 t_mae = float(np.mean(np.abs(df_pair[t_c] - df_pair['obs_temp'])))
                 r_mae = float(np.mean(np.abs(df_pair[p_c] - df_pair['obs_rain'])))
@@ -468,27 +594,33 @@ def evaluate_4way_detailed(df_mod, active_models, df_obs):
                 w_bias = float(np.mean(df_pair[w_c] - df_pair['obs_wind']))
                 w_mae = float(np.mean(np.abs(df_pair[w_c] - df_pair['obs_wind'])))
                 metrics[m_code] = {
-                    'eval_hours': len(df_pair),
+                    'scored': True, 'eval_hours': len(df_pair),
                     'temp_mae': round(t_mae, 2), 'temp_bias': round(t_bias, 2),
                     'rain_mae': round(r_mae, 2), 'prob_brier': round(p_brier, 3),
                     'wind_mae': round(w_mae, 2), 'wind_bias': round(w_bias, 2)
                 }
-            else:
-                metrics[m_code] = {'eval_hours': 0, 'temp_mae': 1.5, 'temp_bias': 0.0, 'rain_mae': 0.5, 'prob_brier': 0.2, 'wind_mae': 1.5, 'wind_bias': 0.0}
-        else:
-            metrics[m_code] = {'eval_hours': 0, 'temp_mae': 1.5, 'temp_bias': 0.0, 'rain_mae': 0.5, 'prob_brier': 0.2, 'wind_mae': 1.5, 'wind_bias': 0.0}
+                scored_keys.append(m_code)
+                continue
 
-    if not metrics:
-        return {}, {}
+        metrics[m_code] = {
+            'scored': False, 'eval_hours': 0,
+            'temp_mae': 0.0, 'temp_bias': 0.0, 'rain_mae': 0.0,
+            'prob_brier': 0.0, 'wind_mae': 0.0, 'wind_bias': 0.0,
+            'score_temp': 0.0, 'score_prob': 0.0, 'score_rain': 0.0, 'score_wind': 0.0
+        }
 
-    t_inv = {k: 1.0 / ((v['temp_mae'] + 0.1) ** 1.5) for k, v in metrics.items()}
-    p_inv = {k: 1.0 / ((v['prob_brier'] + 0.02) ** 1.2) for k, v in metrics.items()}
-    r_inv = {k: 1.0 / ((v['rain_mae'] + 0.05) ** 1.2) for k, v in metrics.items()}
-    w_inv = {k: 1.0 / ((v['wind_mae'] + 0.2) ** 1.2) for k, v in metrics.items()}
-    st, sp, sr, sw = max(1e-9, sum(t_inv.values())), max(1e-9, sum(p_inv.values())), max(1e-9, sum(r_inv.values())), max(1e-9, sum(w_inv.values()))
+    if not scored_keys:
+        return {}, metrics
 
-    daily_w = {}
-    for k in active_models.keys():
+    # 스무딩 역오차 점수 (극단적 배율 폭주 차단)
+    t_inv = {k: 1.0 / (metrics[k]['temp_mae'] + 0.50) for k in scored_keys}
+    p_inv = {k: 1.0 / (metrics[k]['prob_brier'] + 0.12) for k in scored_keys}
+    r_inv = {k: 1.0 / (metrics[k]['rain_mae'] + 0.30) for k in scored_keys}
+    w_inv = {k: 1.0 / (metrics[k]['wind_mae'] + 0.50) for k in scored_keys}
+    st, sp, sr, sw = sum(t_inv.values()), sum(p_inv.values()), sum(r_inv.values()), sum(w_inv.values())
+
+    raw_daily = {}
+    for k in scored_keys:
         score_t = (t_inv[k] / st) * 100.0
         score_p = (p_inv[k] / sp) * 100.0
         score_r = (r_inv[k] / sr) * 100.0
@@ -497,20 +629,52 @@ def evaluate_4way_detailed(df_mod, active_models, df_obs):
         metrics[k]['score_prob'] = round(score_p, 1)
         metrics[k]['score_rain'] = round(score_r, 1)
         metrics[k]['score_wind'] = round(score_w, 1)
-        daily_w[k] = (W_TEMP * score_t) + (W_PROB * score_p) + (W_RAIN * score_r) + (W_WIND * score_w)
+        raw_daily[k] = (W_TEMP * score_t) + (W_PROB * score_p) + (W_RAIN * score_r) + (W_WIND * score_w)
+
+    # 일일 점유율 상/하한 적용 후 100% 정규화
+    capped = {k: float(np.clip(v, DAILY_SCORE_FLOOR, DAILY_SCORE_CAP)) for k, v in raw_daily.items()}
+    c_tot = max(1e-9, sum(capped.values()))
+    daily_w = {k: round((v / c_tot) * 100.0, 2) for k, v in capped.items()}
     return daily_w, metrics
 
-def write_audit_log(region, eval_date, status, obs_source, active_cnt, err_cnt, top_model, top_weight):
+def update_weights_fair(prev_weights, daily_weights, all_model_keys):
+    """채점된 모델끼리만 가중치 풀을 재분배하고, 미채점(결측) 모델은 기존 가중치를 그대로 동결"""
+    eq_w = round(100.0 / max(1, len(all_model_keys)), 2)
+    aligned_prev = {m: prev_weights.get(m, eq_w) for m in all_model_keys}
+    p_tot = max(1e-9, sum(aligned_prev.values()))
+    aligned_prev = {m: (v / p_tot) * 100.0 for m, v in aligned_prev.items()}
+
+    if not daily_weights:
+        return {m: round(v, 2) for m, v in aligned_prev.items()}, {m: round(v, 2) for m, v in aligned_prev.items()}
+
+    scored_pool = sum(aligned_prev[m] for m in daily_weights.keys() if m in aligned_prev)
+    d_tot = max(1e-9, sum(daily_weights.values()))
+
+    new_w = {}
+    for m in all_model_keys:
+        if m in daily_weights:
+            target_m = (daily_weights[m] / d_tot) * scored_pool
+            new_w[m] = (1.0 - LEARNING_RATE) * aligned_prev[m] + LEARNING_RATE * target_m
+        else:
+            new_w[m] = aligned_prev[m]
+
+    # 최종 누적 가중치 상/하한 안전장치 적용 후 100% 정규화
+    bounded = {m: float(np.clip(v, FINAL_WEIGHT_FLOOR, FINAL_WEIGHT_CAP)) for m, v in new_w.items()}
+    b_tot = max(1e-9, sum(bounded.values()))
+    final_w = {m: round((v / b_tot) * 100.0, 2) for m, v in bounded.items()}
+    return {m: round(v, 2) for m, v in aligned_prev.items()}, final_w
+
+def write_audit_log(region, eval_date, status, eval_mode, obs_source, scored_cnt, err_cnt, top_model, top_weight):
     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
     row = pd.DataFrame([{
         "실행시각(KST)": now_str, "지역": region, "채점기준일": eval_date,
-        "갱신상태": status, "관측소소스": obs_source, "가동모델수": active_cnt,
-        "오류건수": err_cnt, "1위모델": top_model, "1위가중치(%)": round(top_weight, 1)
+        "갱신상태": status, "채점방식": eval_mode, "관측소소스": obs_source,
+        "채점모델수": scored_cnt, "오류건수": err_cnt, "1위모델": top_model, "1위가중치(%)": round(top_weight, 1)
     }])
     row.to_csv(AUDIT_LOG_FILE, mode='a' if os.path.exists(AUDIT_LOG_FILE) else 'w', header=not os.path.exists(AUDIT_LOG_FILE), index=False, encoding='utf-8-sig')
 
 # ==========================================
-# [5. 11대 모델 통합 파이프라인 (IndexError 완전 방어)]
+# [6. v8.0 11대 모델 통합 파이프라인 (스냅샷 저장 + 정석 채점)]
 # ==========================================
 def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
     auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
@@ -518,6 +682,9 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
     now_kst = datetime.now(KST).replace(tzinfo=None)
     today_date = now_kst.date()
     today_str = today_date.strftime("%Y-%m-%d")
+    yesterday_date = today_date - timedelta(days=1)
+    yesterday_str = yesterday_date.strftime("%Y%m%d")
+
     SYSTEM_HEALTH["last_check_time"] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
     run_error_count = 0
 
@@ -529,17 +696,14 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
         except Exception:
             history = {}
 
-    days_missed = (today_date - datetime.strptime(history[matched_key]["last_updated"], "%Y-%m-%d").date()).days if matched_key in history else 1
-    past_days_to_fetch = min(7, max(2, days_missed + 1))
-
-    active_models, model_max_hours = {}, {}
+    active_models, model_max_hours, prob_source_map = {}, {}, {}
     om_keys = [k for k in MODELS.keys() if k != "nasa_geos_fp"]
 
     if progress_cb:
-        progress_cb(15, "🌍 [1/3] Open-Meteo 10대 글로벌 모델 로드 중...")
+        progress_cb(15, "🌍 [1/4] Open-Meteo 10대 글로벌 모델 로드 중...")
 
     df_mod, loaded_om, mh_om, om_status, om_msg, om_ms = fetch_open_meteo_resilient(
-        stn_info["lat"], stn_info["lon"], om_keys, past_days_to_fetch, now_kst
+        stn_info["lat"], stn_info["lon"], om_keys, past_days=2, now_kst=now_kst
     )
     if df_mod.empty:
         run_error_count += 1
@@ -548,62 +712,76 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
         mm = MODELS[mc]
         active_models[mc] = mm["name"]
         model_max_hours[mc] = mh_om[mc]
+        prob_source_map[mc] = prob_info
         SYSTEM_HEALTH["model_registry"][mc] = {"status": "✅ 사용중", "max_hours": mh_om[mc], "latency_s": round(om_ms/10000.0, 2), "note": f"정상 ({prob_info})"}
         if log_cb:
-            log_cb(f"✔ [{idx:02d}/11] {mm['name']} ({mm['res']}) 로드 완료 ({mh_om[mc]}시간)")
+            log_cb(f"✔ [{idx:02d}/11] {mm['name']} ({mm['res']}) 로드 완료 ({mh_om[mc]}h, {prob_info})")
 
     SYSTEM_HEALTH["api_status"]["Open-Meteo (10대 통합 NWP)"] = {
         "status": om_status, "code": "200 OK" if not df_mod.empty else "ERR",
         "latency_ms": om_ms, "errors": 0 if not df_mod.empty else 1, "msg": om_msg
     }
 
+    # [11번째 모델] NASA GEOS-FP 순수 예보 호출 (결측 NaN 유지, GFS 복사 없음)
     if progress_cb:
-        progress_cb(65, "🛰️ [11/11] 미국(NASA GEOS) 위성동화 모델 호출 중...")
-    df_nasa, nasa_sec, nasa_note = fetch_nasa_geos_model(stn_info["lat"], stn_info["lon"], past_days_to_fetch, now_kst)
+        progress_cb(55, "🛰️ [2/4] 미국(NASA GEOS-FP) 순수 예보 호출 중...")
+    df_nasa, nasa_sec, nasa_note, nasa_has_rain = fetch_nasa_geos_forecast_only(stn_info["lat"], stn_info["lon"])
 
     if not df_nasa.empty and not df_mod.empty:
         df_na = df_nasa.reindex(df_mod.index)
-        df_na["temperature_2m_nasa_geos_fp"] = df_na["temperature_2m_nasa_geos_fp"].interpolate(method='linear', limit=3)
-        df_na["wind_speed_10m_nasa_geos_fp"] = df_na["wind_speed_10m_nasa_geos_fp"].interpolate(method='linear', limit=3).fillna(0.0)
-        df_na["precipitation_nasa_geos_fp"] = df_na["precipitation_nasa_geos_fp"].fillna(0.0)
-        df_na["precipitation_probability_nasa_geos_fp"] = df_na["precipitation_probability_nasa_geos_fp"].fillna(10.0)
-        df_mod = pd.concat([df_mod, df_na], axis=1)
-
-        nasa_fh = int(df_mod[df_mod.index >= now_kst]["temperature_2m_nasa_geos_fp"].notna().sum())
-        if nasa_fh < 12:
-            ref_m = "gfs_seamless" if "temperature_2m_gfs_seamless" in df_mod.columns else next(iter(loaded_om.keys()), None)
-            if ref_m:
-                fm = df_mod.index >= now_kst
-                df_mod.loc[fm, "temperature_2m_nasa_geos_fp"] = df_mod.loc[fm, f"temperature_2m_{ref_m}"]
-                df_mod.loc[fm, "wind_speed_10m_nasa_geos_fp"] = df_mod.loc[fm, f"wind_speed_10m_{ref_m}"]
-                df_mod.loc[fm, "precipitation_nasa_geos_fp"] = df_mod.loc[fm, f"precipitation_{ref_m}"]
-                df_mod.loc[fm, "precipitation_probability_nasa_geos_fp"] = df_mod.loc[fm, f"precipitation_probability_{ref_m}"]
-                nasa_fh = int(df_mod[fm]["temperature_2m_nasa_geos_fp"].notna().sum())
-
-        active_models["nasa_geos_fp"] = MODELS["nasa_geos_fp"]["name"]
-        model_max_hours["nasa_geos_fp"] = max(24, nasa_fh)
-        SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": "✅ 사용중", "max_hours": model_max_hours["nasa_geos_fp"], "latency_s": round(nasa_sec, 2), "note": f"NASA ({nasa_note})"}
+        nasa_fh = int(df_na[df_na.index >= now_kst]["temperature_2m_nasa_geos_fp"].notna().sum())
+        if nasa_fh >= 12:
+            df_mod = pd.concat([df_mod, df_na], axis=1)
+            active_models["nasa_geos_fp"] = MODELS["nasa_geos_fp"]["name"]
+            model_max_hours["nasa_geos_fp"] = nasa_fh
+            prob_source_map["nasa_geos_fp"] = "강수환산" if nasa_has_rain else "강수미수신(NaN)"
+            SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {
+                "status": "✅ 사용중" if nasa_has_rain else "⚠️ 강수누락",
+                "max_hours": nasa_fh, "latency_s": round(nasa_sec, 2), "note": nasa_note
+            }
+            if log_cb:
+                log_cb(f"✔ [11/11] 미국(NASA GEOS) 로드 ({nasa_fh}h, {nasa_note})")
+    else:
+        SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {
+            "status": "⚠️ 미수신(제외)", "max_hours": 0, "latency_s": round(nasa_sec, 2), "note": nasa_note
+        }
         if log_cb:
-            log_cb(f"✔ [11/11] 미국(NASA GEOS) (25km) 로드 완료 ({nasa_note})")
+            log_cb(f"⚠️ [11/11] 미국(NASA GEOS) {nasa_note}")
+
+    # 오늘 최초 실행 시 오늘~내일 예보 원본을 JSON 스냅샷으로 고정 저장
+    snap_saved_now = save_forecast_snapshot(matched_key, today_date, now_kst, df_mod, active_models)
 
     if progress_cb:
-        progress_cb(80, f"📡 [2/3] 기상청 '{matched_key}' 관측소 실측 대조 및 채점 중...")
-    yesterday_str = (today_date - timedelta(days=1)).strftime("%Y%m%d")
-    df_obs_y, obs_source_msg = fetch_kma_obs_v7(stn_info, yesterday_str, KMA_AUTH_KEY)
+        progress_cb(75, f"📡 [3/4] 기상청 '{matched_key}' 어제 실측 & 스냅샷 대조 중...")
+    df_obs_y, obs_source_msg = fetch_kma_obs_v8(stn_info, yesterday_str, KMA_AUTH_KEY)
 
-    # 미래 예측 데이터가 전혀 없는 경우 안전 종료 (크래시 방지)
     if df_mod.empty or not active_models:
         if progress_cb:
             progress_cb(100, "⚠️ 기상 모델 응답 지연")
         return {
             "region_name": matched_key, "station_info": stn_info, "now_kst": now_kst,
-            "yesterday_str": yesterday_str, "obs_source_msg": obs_source_msg, "obs_summary": {},
-            "weight_status_msg": f"⚠️ Open-Meteo 응답 지연 ({om_msg})", "active_models": {}, "model_max_hours": {},
+            "yesterday_str": yesterday_str, "obs_source_msg": obs_source_msg, "eval_mode_msg": "모델 응답 지연",
+            "obs_summary": {}, "weight_status_msg": f"⚠️ Open-Meteo 응답 지연 ({om_msg})",
+            "active_models": {}, "model_max_hours": {}, "prob_source_map": {},
             "metrics": {}, "cum_weights": {}, "prev_weights": {}, "daily_weights": {},
-            "df_future_all": pd.DataFrame(), "run_error_count": run_error_count + 1
+            "df_future_all": pd.DataFrame(), "run_error_count": run_error_count + 1, "snap_saved_now": False
         }
 
-    daily_weights, metrics = evaluate_4way_detailed(df_mod, active_models, df_obs_y)
+    # [핵심] 어제 채점 데이터 로드: 1순위 스냅샷 JSON, 2순위 임시 Open-Meteo past_days (NASA 제외)
+    df_snap_y, eval_mode_msg = load_yesterday_snapshot(matched_key, yesterday_date)
+    if not df_snap_y.empty:
+        df_eval = df_snap_y
+        eval_candidates = list(MODELS.keys())
+    else:
+        y_start, y_end = pd.Timestamp(yesterday_date), pd.Timestamp(yesterday_date) + pd.Timedelta(hours=23)
+        df_eval = df_mod[(df_mod.index >= y_start) & (df_mod.index <= y_end)]
+        # 임시 past_days 구간에서는 순수 예보 아카이브가 없는 NASA를 채점 대상에서 자동 제외
+        eval_candidates = [k for k in active_models.keys() if k != "nasa_geos_fp"]
+
+    daily_weights, metrics = evaluate_4way_fair(df_eval, eval_candidates, df_obs_y)
+    for k in MODELS.keys():
+        if k not in metrics:
+            metrics[k] = {'scored': False, 'eval_hours': 0, 'temp_mae': 0.0, 'temp_bias': 0.0, 'rain_mae': 0.0, 'prob_brier': 0.0, 'wind_mae': 0.0, 'wind_bias': 0.0, 'score_temp': 0.0, 'score_prob': 0.0, 'score_rain': 0.0, 'score_wind': 0.0}
 
     obs_summary = {}
     if not df_obs_y.empty:
@@ -617,48 +795,35 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
             "wind_max": round(float(df_obs_y['obs_wind'].max()), 1)
         }
 
-    default_eq_w = round(100.0 / max(1, len(daily_weights)), 2)
-    if matched_key not in history:
-        init_w = {m: default_eq_w for m in daily_weights.keys()}
-        new_cum = {m: (1.0 - LEARNING_RATE) * init_w[m] + (LEARNING_RATE * d_w) for m, d_w in daily_weights.items()}
-        tot = max(1e-9, sum(new_cum.values()))
-        new_cum = {m: round((v / tot) * 100.0, 2) for m, v in new_cum.items()}
+    all_keys = list(MODELS.keys())
+    if matched_key not in history or history[matched_key].get("rule_version") != WEIGHT_RULE_VERSION:
+        eq_init = {m: round(100.0 / len(all_keys), 2) for m in all_keys}
+        aligned_prev, new_cum = update_weights_fair(eq_init, daily_weights, all_keys)
         history[matched_key] = {
             "created_date": today_str, "last_updated": today_str, "update_count": 1,
-            "rule_version": WEIGHT_RULE_VERSION,
-            "prev_weights": init_w, "daily_weights": {k: round(v, 2) for k, v in daily_weights.items()},
+            "rule_version": WEIGHT_RULE_VERSION, "eval_mode": eval_mode_msg,
+            "prev_weights": aligned_prev, "daily_weights": daily_weights,
             "cumulative_weights": new_cum, "latest_metrics": metrics,
             "obs_source": obs_source_msg, "obs_summary": obs_summary, "last_error_count": run_error_count
         }
         top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
-        write_audit_log(matched_key, yesterday_str, "신규(확률90%/강수5%)", obs_source_msg, len(active_models), run_error_count, MODELS[top_m]["name"], top_w)
-        weight_status_msg = f"🆕 강수확률 90%·강수량 5% 가중치 최초 생성({today_str}) 완료"
+        write_audit_log(matched_key, yesterday_str, "v8신규초기화", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
+        weight_status_msg = f"🆕 v8.0 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점, 미수신 모델 동결)"
     else:
         reg_data = history[matched_key]
-        old_cum_map = reg_data.get("cumulative_weights", {})
-        rule_changed = reg_data.get("rule_version") != WEIGHT_RULE_VERSION
-
-        if reg_data.get("last_updated") != today_str or rule_changed or len(old_cum_map) != len(daily_weights):
-            base_prev = {m: default_eq_w for m in daily_weights.keys()} if rule_changed else {m: old_cum_map.get(m, default_eq_w) for m in daily_weights.keys()}
-            tot_p = max(1e-9, sum(base_prev.values()))
-            aligned_prev = {m: round((v / tot_p) * 100.0, 2) for m, v in base_prev.items()}
-
-            new_cum = {m: (1.0 - LEARNING_RATE) * aligned_prev[m] + (LEARNING_RATE * daily_weights[m]) for m in daily_weights.keys()}
-            tot = max(1e-9, sum(new_cum.values()))
-            new_cum = {m: round((v / tot) * 100.0, 2) for m, v in new_cum.items()}
-
-            if reg_data.get("last_updated") != today_str:
-                reg_data["update_count"] = reg_data.get("update_count", 1) + 1
-            reg_data["rule_version"] = WEIGHT_RULE_VERSION
+        if reg_data.get("last_updated") != today_str:
+            aligned_prev, new_cum = update_weights_fair(reg_data.get("cumulative_weights", {}), daily_weights, all_keys)
+            reg_data["update_count"] = reg_data.get("update_count", 1) + 1
             reg_data["prev_weights"] = aligned_prev
-            reg_data["daily_weights"] = {k: round(v, 2) for k, v in daily_weights.items()}
+            reg_data["daily_weights"] = daily_weights
             reg_data["cumulative_weights"] = new_cum
             reg_data["last_updated"] = today_str
+            reg_data["eval_mode"] = eval_mode_msg
             top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
-            write_audit_log(matched_key, yesterday_str, "갱신(확률90%/강수5%)", obs_source_msg, len(active_models), run_error_count, MODELS[top_m]["name"], top_w)
-            weight_status_msg = f"🔄 강수확률 90% · 강수량 5% 비중 재채점 완료 (누적 {reg_data['update_count']}일 차)"
+            write_audit_log(matched_key, yesterday_str, f"갱신({reg_data['update_count']}일차)", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
+            weight_status_msg = f"🔄 일일 가중치 갱신 완료 (누적 {reg_data['update_count']}일 차, {len(daily_weights)}개 채점)"
         else:
-            weight_status_msg = f"🔒 오늘({today_str}) 강수확률 90% · 강수량 5% 가중치 적용 완료 (누적 {reg_data['update_count']}일 차)"
+            weight_status_msg = f"🔒 오늘({today_str}) 가중치 갱신 완료 상태 (누적 {reg_data['update_count']}일 차 유지)"
 
         reg_data["latest_metrics"] = metrics
         reg_data["obs_source"] = obs_source_msg
@@ -669,42 +834,47 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
     prev_weights = history[matched_key]["prev_weights"]
 
     if progress_cb:
-        progress_cb(92, "✨ [3/3] 11대 모델 영점 보정 및 7일 예보 합성 중...")
+        progress_cb(92, "✨ [4/4] 영점 보정 및 7일 앙상블 예보 합성 중...")
 
     ens_t, ens_p, ens_r, ens_w, conf_list, act_cnt = [], [], [], [], [], []
     for _, row in df_mod.iterrows():
-        t_sum, p_sum, r_sum, wind_sum, w_sum, cnt = 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        t_sum, t_wsum = 0.0, 0.0
+        p_sum, p_wsum = 0.0, 0.0
+        r_sum, r_wsum = 0.0, 0.0
+        w_sum, w_wsum = 0.0, 0.0
+        cnt = 0
         hour_temps, hour_probs = [], []
-        for m_code, w_pct in cum_weights.items():
-            if m_code not in metrics:
-                continue
+
+        for m_code in active_models.keys():
+            w = cum_weights.get(m_code, 9.0) / 100.0
             raw_t = row.get(f"temperature_2m_{m_code}", np.nan)
             if pd.notnull(raw_t):
-                w = w_pct / 100.0
-                t_bias = np.clip(metrics[m_code]['temp_bias'] * 0.7, -3.0, 3.0)
-                w_bias = np.clip(metrics[m_code]['wind_bias'] * 0.5, -3.0, 3.0)
+                mt = metrics.get(m_code, {})
+                t_bias = np.clip(mt.get('temp_bias', 0.0) * 0.7, -3.0, 3.0) if mt.get('scored') else 0.0
+                w_bias = np.clip(mt.get('wind_bias', 0.0) * 0.5, -3.0, 3.0) if mt.get('scored') else 0.0
                 corr_t = raw_t - t_bias
-                raw_w = row.get(f"wind_speed_10m_{m_code}", 0.0)
-                corr_w = max(0.0, (raw_w if pd.notnull(raw_w) else 0.0) - w_bias)
-                prob_v = row.get(f"precipitation_probability_{m_code}", 0.0)
-                prob_v = prob_v if pd.notnull(prob_v) else 0.0
-                rain_v = row.get(f"precipitation_{m_code}", 0.0)
-                rain_v = rain_v if pd.notnull(rain_v) else 0.0
-
-                t_sum += corr_t * w
-                p_sum += prob_v * w
-                r_sum += rain_v * w
-                wind_sum += corr_w * w
-                w_sum += w
-                cnt += 1
+                t_sum += corr_t * w; t_wsum += w
                 hour_temps.append(corr_t)
-                hour_probs.append(prob_v)
+                cnt += 1
 
-        if w_sum > 0:
-            ens_t.append(t_sum / w_sum)
-            ens_p.append(p_sum / w_sum)
-            ens_r.append(r_sum / w_sum)
-            ens_w.append(wind_sum / w_sum)
+                raw_w = row.get(f"wind_speed_10m_{m_code}", np.nan)
+                if pd.notnull(raw_w):
+                    w_sum += max(0.0, raw_w - w_bias) * w; w_wsum += w
+
+                raw_p = row.get(f"precipitation_probability_{m_code}", np.nan)
+                if pd.notnull(raw_p):
+                    p_sum += raw_p * w; p_wsum += w
+                    hour_probs.append(raw_p)
+
+                raw_r = row.get(f"precipitation_{m_code}", np.nan)
+                if pd.notnull(raw_r):
+                    r_sum += raw_r * w; r_wsum += w
+
+        if t_wsum > 0:
+            ens_t.append(t_sum / t_wsum)
+            ens_p.append(p_sum / p_wsum if p_wsum > 0 else 0.0)
+            ens_r.append(r_sum / r_wsum if r_wsum > 0 else 0.0)
+            ens_w.append(w_sum / w_wsum if w_wsum > 0 else 0.0)
             t_std = float(np.std(hour_temps)) if len(hour_temps) > 1 else 0.5
             p_std = float(np.std(hour_probs)) if len(hour_probs) > 1 else 10.0
             conf_list.append(np.clip(98.0 - (t_std * 11.0) - (p_std * 0.35), 40.0, 98.0))
@@ -725,14 +895,16 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
 
     return {
         "region_name": matched_key, "station_info": stn_info, "now_kst": now_kst,
-        "yesterday_str": yesterday_str, "obs_source_msg": obs_source_msg, "obs_summary": obs_summary,
-        "weight_status_msg": weight_status_msg, "active_models": active_models, "model_max_hours": model_max_hours,
+        "yesterday_str": yesterday_str, "obs_source_msg": obs_source_msg, "eval_mode_msg": eval_mode_msg,
+        "obs_summary": obs_summary, "weight_status_msg": weight_status_msg,
+        "active_models": active_models, "model_max_hours": model_max_hours, "prob_source_map": prob_source_map,
         "metrics": metrics, "cum_weights": cum_weights, "prev_weights": prev_weights,
-        "daily_weights": daily_weights, "df_future_all": df_future_all, "run_error_count": run_error_count
+        "daily_weights": daily_weights, "df_future_all": df_future_all,
+        "run_error_count": run_error_count, "snap_saved_now": snap_saved_now
     }
 
 # ==========================================
-# [6. 카카오톡 메시지 생성 및 양방향 처리]
+# [7. 카카오톡 메시지 생성 및 양방향 처리]
 # ==========================================
 def format_kakao_weather_reply(res_data):
     region_name = res_data["region_name"]
@@ -743,11 +915,11 @@ def format_kakao_weather_reply(res_data):
     sorted_w = sorted(res_data["cum_weights"].items(), key=lambda x: x[1], reverse=True)
 
     top1_code, top1_w = sorted_w[0]
-    top1_name = res_data["active_models"].get(top1_code, top1_code)
-    top1_m = res_data["metrics"].get(top1_code, {"prob_brier": 0.0, "rain_mae": 0.0})
+    top1_name = MODELS.get(top1_code, {}).get("name", top1_code)
+    top1_m = res_data["metrics"].get(top1_code, {})
     top1_diff = top1_w - res_data["prev_weights"].get(top1_code, 9.1)
     top1_diff_str = f"▲+{top1_diff:.1f}%" if top1_diff >= 0 else f"▼{top1_diff:.1f}%"
-    top3_str = " / ".join([f"{rk}위 {res_data['active_models'].get(mc, mc)}({fw:.1f}%)" for rk, (mc, fw) in enumerate(sorted_w[:3], 1)])
+    top3_str = " / ".join([f"{rk}위 {MODELS.get(mc,{}).get('name',mc)}({fw:.1f}%)" for rk, (mc, fw) in enumerate(sorted_w[:3], 1)])
 
     now_t, min_t, max_t = df_24h['Ensemble_Temp'].iloc[0], df_24h['Ensemble_Temp'].min(), df_24h['Ensemble_Temp'].max()
     max_prob, sum_rain, max_wind, avg_conf = df_24h['Ensemble_Prob'].max(), df_24h['Ensemble_Rain'].sum(), df_24h['Ensemble_Wind'].max(), df_24h['Confidence'].mean()
@@ -759,11 +931,12 @@ def format_kakao_weather_reply(res_data):
         lines_24h.append(f"• {idx.strftime('%d일 %H시')}: {row['Ensemble_Temp']:>4.1f}℃ | 💨{row['Ensemble_Wind']:.1f}m/s | {r_lbl}")
 
     return (
-        f"🌴 [{region_name} 맞춤 브리핑 (확률90%·강수5% 가중치)]\n"
-        f"🕒 기준: {res_data['now_kst'].strftime('%m/%d %H:%M')} | 채점: {res_data['obs_source_msg']}\n"
+        f"🌴 [{region_name} v8.0 맞춤 브리핑 (확률90%·강수5%)]\n"
+        f"🕒 기준: {res_data['now_kst'].strftime('%m/%d %H:%M')}\n"
+        f"📸 채점: {res_data['eval_mode_msg']}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🏆 [1위 모델: {top1_name} ({top1_w:.1f}%, {top1_diff_str})]\n"
-        f"• 확률오차(BS): {top1_m['prob_brier']:.3f} | 강수오차: ±{top1_m['rain_mae']:.1f}mm\n"
+        f"• 확률BS: {top1_m.get('prob_brier',0):.3f} | 강수MAE: ±{top1_m.get('rain_mae',0):.2f}mm\n"
         f"• TOP3: {top3_str}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🌤️ [향후 24시간 요약 (신뢰도 {avg_conf:.0f}%)]\n"
@@ -777,6 +950,9 @@ def format_kakao_status_reply():
     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     sec_kma = "🔒암호화 연동됨" if KMA_AUTH_KEY else "⚠️미설정(Secrets 등록필요)"
     api_lines = [f"• {k}: {v['status']} ({v['latency_ms']}ms) - {v['msg']}" for k, v in SYSTEM_HEALTH["api_status"].items()]
+    snaps = list_saved_snapshots()
+    snap_txt = ", ".join(snaps) if snaps else "아직 저장된 스냅샷 없음 (Actions 1회 실행 필요)"
+
     reg_lines = []
     if os.path.exists(WEIGHT_HISTORY_FILE):
         with open(WEIGHT_HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -784,12 +960,13 @@ def format_kakao_status_reply():
         for reg, info in list(history.items())[:16]:
             w_map = info.get("cumulative_weights", {})
             top_m, top_w = max(w_map.items(), key=lambda x: x[1]) if w_map else ("-", 0)
-            reg_lines.append(f"• {reg}({info.get('update_count',1)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | 신뢰도 {info.get('avg_confidence_48h',0)}%")
+            reg_lines.append(f"• {reg}({info.get('update_count',1)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | {info.get('eval_mode','-')[:14]}")
 
     return (
-        f"🖥️ [제주 기상 앙상블 상태 & 보안 대시보드]\n"
+        f"🖥️ [제주 기상 앙상블 v8.0 상태 & 스냅샷 대시보드]\n"
         f"🕒 조회시각: {now_str} | 기상청키: {sec_kma}\n"
-        f"⚖️ 가중치 배분: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5%\n"
+        f"⚖️ 가중치: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% (상한 30%)\n"
+        f"📸 보관된 예보 스냅샷: {snap_txt}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📡 [1. API 통신 건전성]\n" + "\n".join(api_lines) + "\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -808,36 +985,67 @@ def handle_kakao_command(user_msg):
     if matched_key: return format_kakao_weather_reply(run_station_pipeline(matched_key))
     return f"⚠️ '{clean_msg}' 관측소를 찾을 수 없습니다."
 
+def send_kakao_memo_to_me(text_msg, rest_api_key, refresh_token):
+    if not rest_api_key or not refresh_token:
+        return False
+    try:
+        tk_res = requests.post(
+            "https://kauth.kakao.com/oauth/token",
+            data={"grant_type": "refresh_token", "client_id": rest_api_key, "refresh_token": refresh_token},
+            timeout=8
+        ).json()
+        access_token = tk_res.get("access_token")
+        if not access_token:
+            return False
+        template_obj = {
+            "object_type": "text", "text": text_msg[:1950],
+            "link": {"web_url": "https://smartydarong.streamlit.app", "mobile_web_url": "https://smartydarong.streamlit.app"},
+            "button_title": "모바일 대시보드 열기"
+        }
+        send_res = requests.post(
+            "https://kapi.kakao.com/v2/api/talk/memo/default/send",
+            headers={"Authorization": f"Bearer {access_token}"},
+            data={"template_object": json.dumps(template_obj)}, timeout=8
+        ).json()
+        return send_res.get("result_code") == 0
+    except Exception:
+        return False
+
 # ==========================================
-# [7. GitHub Actions 무인 배치 모드 (--auto-update)]
+# [8. GitHub Actions 무인 배치 모드 (--auto-update)]
 # ==========================================
 if "--auto-update" in sys.argv:
-    print("🚀 [무인 스케줄러] 강수확률 90% · 강수량 5% 기준 제주 16개 관측소 자동 학습 시작...")
+    print("🚀 [무인 스케줄러 v8.0] 스냅샷 저장 + 익일 정석 채점 시작...")
     auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
+    alert_res = None
     for idx, reg in enumerate(list(JEJU_STATIONS.keys())[:16], 1):
         try:
-            print(f" -> [{idx}/16] '{reg}' 관측소 채점 중...")
-            run_station_pipeline(reg)
+            print(f" -> [{idx}/16] '{reg}' 스냅샷 저장 및 공정 채점 중...")
+            r_obj = run_station_pipeline(reg)
+            if reg == ALERT_REGION:
+                alert_res = r_obj
             time.sleep(0.8)
         except Exception as e:
             print(f" ⚠️ '{reg}' 예외 건너뜀: {e}")
-    print("✅ [무인 스케줄러 완료]")
+    if alert_res is not None:
+        send_kakao_memo_to_me(format_kakao_weather_reply(alert_res), KAKAO_REST_API_KEY, KAKAO_REFRESH_TOKEN)
+    print("✅ [무인 스케줄러 v8.0 완료]")
     sys.exit(0)
 
 # ==========================================
-# [8. 스마트폰 모바일 웹 앱 화면 (Streamlit UI)]
+# [9. 스마트폰 모바일 웹 앱 화면 (Streamlit UI)]
 # ==========================================
 import streamlit as st
 
-st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v7.8", page_icon="🌴", layout="wide")
+st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v8.0", page_icon="🌴", layout="wide")
 auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
 
 if "kakao_msg" in st.query_params:
     st.code(handle_kakao_command(st.query_params["kakao_msg"]))
     st.stop()
 
-st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v7.8 (강수확률 90% · 강수량 5% 특화판)")
-st.caption("가중치 반영 비중: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% | 11대 모델(NASA GEOS 포함) & 오류 방어 적용")
+st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v8.0 (스냅샷 정석 채점 · 공정 가중치)")
+st.caption("가중치: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% | 스냅샷 익일 대조 · 결측 동결 · 누적 상한 30%")
 
 if not KMA_AUTH_KEY:
     st.warning("⚠️ Streamlit Secrets에 `KMA_AUTH_KEY`가 등록되지 않아 기상청 실측 채점이 비활성화되었습니다. 우측 하단 Manage app → Settings → Secrets에 등록해 주세요.")
@@ -845,7 +1053,7 @@ if not KMA_AUTH_KEY:
 tab_forecast, tab_kakao, tab_status = st.tabs([
     "🌤️ 지역별 맞춤 예보 (터치 조회)",
     "💬 카카오톡 양방향 봇 채팅 & 연동",
-    "🖥️ 다중 인자 상태 & 진단 대시보드"
+    "🖥️ 스냅샷 · 다중 인자 상태 대시보드"
 ])
 
 with tab_forecast:
@@ -863,7 +1071,8 @@ with tab_forecast:
     if run_clicked or "last_result" not in st.session_state or st.session_state.get("last_region") != selected_region:
         if run_clicked:
             _OM_CACHE.clear()
-        with st.status(f"🔄 [{selected_region} 관측소] 11대 모델 로드 및 강수확률 90% · 강수량 5% 채점 중...", expanded=True) as status_box:
+            _NASA_CACHE.clear()
+        with st.status(f"🔄 [{selected_region} 관측소] 11대 모델 로드 · 스냅샷 검증 · 공정 채점 중...", expanded=True) as status_box:
             p_bar = st.progress(0, text="초기화 중...")
             log_box = st.empty()
             logs = []
@@ -874,23 +1083,22 @@ with tab_forecast:
             )
             st.session_state["last_result"] = result
             st.session_state["last_region"] = selected_region
-            status_box.update(label=f"✅ [{selected_region}] 분석 완료!", state="complete", expanded=False)
+            status_box.update(label=f"✅ [{selected_region}] v8.0 분석 완료!", state="complete", expanded=False)
 
     res = st.session_state["last_result"]
     df_fut = res["df_future_all"]
     df_24h = df_fut.head(24)
 
-    # 빈 데이터 크래시(IndexError) 원천 방어
     if df_24h.empty or not res["cum_weights"]:
         st.error(f"❌ **[{selected_region}] 기상 모델 데이터를 불러오지 못했습니다.** ({res['weight_status_msg']})")
-        st.info("💡 Open-Meteo 서버의 일시적인 공용 IP 호출 제한(HTTP 429)일 가능성이 높습니다. 10초 뒤 우측의 **[🔍 실시간 예보 & 채점 실행]** 버튼을 다시 눌러주세요.")
+        st.info("💡 10초 뒤 우측의 **[🔍 실시간 예보 & 채점 실행]** 버튼을 다시 눌러주세요.")
         st.code(format_kakao_status_reply())
     else:
         sorted_w = sorted(res["cum_weights"].items(), key=lambda x: x[1], reverse=True)
         top_m_code, top_m_w = sorted_w[0]
-        top_m_name = res["active_models"].get(top_m_code, top_m_code)
+        top_m_name = MODELS.get(top_m_code, {}).get("name", top_m_code)
 
-        st.success(f"✅ **[가중치 배분: 강수확률 90% · 강수량 5% · 기온 2.5% · 풍속 2.5%]** | 채점 소스: {res['obs_source_msg']} | {res['weight_status_msg']}")
+        st.success(f"✅ **{res['eval_mode_msg']}** | 관측소: {res['obs_source_msg']} | {res['weight_status_msg']}")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("☔ 24시간 강수확률 / 강수량", f"최대 {df_24h['Ensemble_Prob'].max():.0f} %", f"누적 {df_24h['Ensemble_Rain'].sum():.1f} mm")
@@ -898,22 +1106,26 @@ with tab_forecast:
         m3.metric("💨 24시간 최대 풍속", f"{df_24h['Ensemble_Wind'].max():.1f} m/s", f"평균 신뢰도 {df_24h['Confidence'].mean():.0f}%")
         m4.metric("🏆 강수 특화 1위 모델", top_m_name, f"가중치 {top_m_w:.1f}%")
 
-        st.markdown(f"#### 📊 1. [{selected_region}] 11대 기상모델 성적표 (강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5%)")
+        st.markdown(f"#### 📊 1. [{selected_region}] 11대 기상모델 공정 채점 성적표 (강수확률 90% · 강수량 5% · 기온 2.5% · 풍속 2.5%)")
         score_rows = []
         for rk, (mc, fw) in enumerate(sorted_w, 1):
-            me = res["metrics"].get(mc, {"prob_brier": 0.0, "rain_mae": 0.0, "temp_mae": 0.0, "temp_bias": 0.0, "wind_mae": 0.0})
+            me = res["metrics"].get(mc, {})
             pw = res["prev_weights"].get(mc, 9.1)
             diff = fw - pw
+            is_scored = me.get("scored", False)
+            m_hrs = res["model_max_hours"].get(mc, 0)
+            p_src = res["prob_source_map"].get(mc, "미수신")
             score_rows.append({
                 "순위": f"{rk}위",
-                "기상 모델(예보범위)": f"{res['active_models'].get(mc, mc)} ({res['model_max_hours'].get(mc, 0)}h)",
-                "확률오차(BS, 90%반영)": f"{me['prob_brier']:.3f} ({me.get('score_prob',0):.1f}점)",
-                "강수오차(5%반영)": f"±{me['rain_mae']:.2f}mm ({me.get('score_rain',0):.1f}점)",
-                "기온/풍속오차(각2.5%)": f"±{me['temp_mae']:.1f}℃(보정{-me['temp_bias']*0.7:+.1f}℃) / ±{me['wind_mae']:.1f}m/s",
-                "이전 누적(%)": f"{pw:.1f}%",
-                "당일 성적(%)": f"{res['daily_weights'].get(mc, fw):.1f}%",
+                "기상 모델(예보범위)": f"{MODELS[mc]['name']} ({m_hrs}h)" if m_hrs > 0 else f"{MODELS[mc]['name']} (미수신)",
+                "채점 상태": f"✅ 채점({me.get('eval_hours',0)}h·{p_src})" if is_scored else "⏸️ 제외(가중치 동결)",
+                "확률오차(BS, 90%)": f"{me['prob_brier']:.3f} ({me.get('score_prob',0):.1f}점)" if is_scored else "-",
+                "강수오차(5%)": f"±{me['rain_mae']:.2f}mm ({me.get('score_rain',0):.1f}점)" if is_scored else "-",
+                "기온/풍속오차(각2.5%)": f"±{me['temp_mae']:.1f}℃(보정{-me['temp_bias']*0.7:+.1f}℃) / ±{me['wind_mae']:.1f}m/s" if is_scored else "-",
+                "이전(%)": f"{pw:.1f}%",
+                "당일(%)": f"{res['daily_weights'][mc]:.1f}%" if mc in res["daily_weights"] else "동결",
                 "최종 가중치(%)": round(fw, 1),
-                "변동": f"▲+{diff:.1f}%" if diff >= 0 else f"▼{diff:.1f}%"
+                "변동": f"▲+{diff:.1f}%" if diff > 0 else (f"▼{diff:.1f}%" if diff < 0 else "0.0%")
             })
         st.dataframe(pd.DataFrame(score_rows), use_container_width=True, hide_index=True)
 
@@ -952,7 +1164,7 @@ with tab_forecast:
 with tab_kakao:
     st.markdown("#### 💬 카카오톡 양방향 실시간 대화 테스트")
     if "chat_history" not in st.session_state:
-        st.session_state["chat_history"] = [{"role": "assistant", "content": "안녕하세요! 강수확률 90%·강수량 5% 가중치가 적용된 제주 기상 봇입니다. '함덕', '서귀포', '애월', '상태'를 입력해 보세요."}]
+        st.session_state["chat_history"] = [{"role": "assistant", "content": "안녕하세요! v8.0 스냅샷 정석 채점이 적용된 제주 기상 봇입니다. '함덕', '서귀포', '애월', '상태'를 입력해 보세요."}]
     for chat in st.session_state["chat_history"]:
         with st.chat_message(chat["role"]): st.text(chat["content"])
     user_query = st.chat_input("메시지를 입력하세요 (예: 함덕, 서귀포, 애월, 상태)")
@@ -966,5 +1178,5 @@ with tab_kakao:
         st.session_state["chat_history"].append({"role": "assistant", "content": bot_reply})
 
 with tab_status:
-    st.markdown("#### 🖥️ 다중 인자 상태 & 보안 대시보드")
+    st.markdown("#### 🖥️ 스냅샷 아카이브 · 다중 인자 상태 & 보안 대시보드")
     st.code(format_kakao_status_reply())
