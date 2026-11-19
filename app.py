@@ -14,7 +14,7 @@ import numpy as np
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# [0. 시크릿 로더 및 v8.0 공정 가중치 설정]
+# [0. 시크릿 로더 및 v8.1 공정 가중치 설정]
 # ==========================================
 def get_secret_key(key_name, default_val=""):
     val = os.environ.get(key_name, "")
@@ -32,9 +32,6 @@ KST = timezone(timedelta(hours=9))
 KMA_AUTH_KEY = get_secret_key("KMA_AUTH_KEY", "")
 NASA_USER = get_secret_key("NASA_USER", "")
 NASA_PASS = get_secret_key("NASA_PASS", "")
-KAKAO_REST_API_KEY = get_secret_key("KAKAO_REST_API_KEY", "")
-KAKAO_REFRESH_TOKEN = get_secret_key("KAKAO_REFRESH_TOKEN", "")
-ALERT_REGION = get_secret_key("ALERT_REGION", "함덕")
 
 LEARNING_RATE = 0.20
 W_PROB = 0.90
@@ -55,7 +52,7 @@ WEIGHT_HISTORY_FILE = os.path.join(SAVE_DIR, "jeju_cumulative_weights_v8.json")
 AUDIT_LOG_FILE = os.path.join(SAVE_DIR, "automation_audit_log_v8.csv")
 
 SYSTEM_HEALTH = {
-    "storage_mode": "✅ v8.0 스냅샷 정석 채점 & 공정 가중치(확률90%·강수5%) 가동 중",
+    "storage_mode": "✅ v8.1 스냅샷 정석 채점 & 공정 가중치(확률90%·강수5%) 가동 중",
     "storage_path": SAVE_DIR,
     "total_error_count": 0,
     "last_check_time": "-",
@@ -110,7 +107,6 @@ MODELS = {
 }
 
 def estimate_prob_from_rain(rain_series):
-    """강수확률 미제공 모델용 보수적 환산 (무강수 15% 적용으로 맑은 날 과대평가 방지, NaN은 NaN 유지)"""
     conds = [rain_series.isna(), rain_series <= 0.0, rain_series <= 0.2, rain_series <= 1.0, rain_series <= 3.0]
     choices = [np.nan, 15.0, 40.0, 65.0, 82.0]
     return pd.Series(np.select(conds, choices, default=92.0), index=rain_series.index)
@@ -130,8 +126,7 @@ def _to_json_list(series):
 def prune_old_snapshots(keep_days=14):
     cutoff = (datetime.now(KST).date() - timedelta(days=keep_days)).strftime("%Y%m%d")
     for fp in glob.glob(os.path.join(SNAPSHOT_DIR, "snapshots_*.json")):
-        fname = os.path.basename(fp)
-        ymd = fname.replace("snapshots_", "").replace(".json", "")
+        ymd = os.path.basename(fp).replace("snapshots_", "").replace(".json", "")
         if ymd.isdigit() and ymd < cutoff:
             try:
                 os.remove(fp)
@@ -139,7 +134,6 @@ def prune_old_snapshots(keep_days=14):
                 pass
 
 def save_forecast_snapshot(region_name, today_date, now_kst, df_mod, active_models):
-    """오늘 최초 실행 시 오늘~내일(48시간) 예보 원본을 JSON 스냅샷으로 고정 저장 (당일 덮어쓰기 금지)"""
     if df_mod.empty or not active_models:
         return False
     ymd = today_date.strftime("%Y%m%d")
@@ -153,7 +147,6 @@ def save_forecast_snapshot(region_name, today_date, now_kst, df_mod, active_mode
         except Exception:
             snap_db = {}
 
-    # 이미 오늘 스냅샷이 저장된 지역이면 덮어쓰지 않음 (아침 원형 예보 보존)
     if region_name in snap_db:
         return False
 
@@ -188,11 +181,6 @@ def save_forecast_snapshot(region_name, today_date, now_kst, df_mod, active_mode
     return True
 
 def load_yesterday_snapshot(region_name, yesterday_date):
-    """
-    어제 날짜(yesterday_date)의 정석 채점용 스냅샷을 탐색합니다.
-    1순위: 그제 저장된 스냅샷 (진짜 24시간 전 발표 예보)
-    2순위: 어제 새벽 저장된 스냅샷 (당일 아침 발표 예보)
-    """
     y_start = pd.Timestamp(yesterday_date)
     y_end = y_start + pd.Timedelta(hours=23)
     candidates = [
@@ -226,7 +214,7 @@ def load_yesterday_snapshot(region_name, yesterday_date):
         except Exception:
             continue
 
-    return pd.DataFrame(), "⏳ 스냅샷 미축적 (임시 Open-Meteo 단기치 채점 · 내일부터 정석 전환)"
+    return pd.DataFrame(), "⏳ 스냅샷 미축적 (임시 Open-Meteo 단기치 채점 · 익일부터 정석 전환)"
 
 def list_saved_snapshots():
     files = sorted(glob.glob(os.path.join(SNAPSHOT_DIR, "snapshots_*.json")), reverse=True)
@@ -358,10 +346,8 @@ def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst):
     return pd.DataFrame(), {}, {}, "❌ 통신실패", f"HTTP {last_code}: {last_reason}", ms
 
 # ==========================================
-# [3. NASA GEOS-FP 순수 예보 전용 수집기 (결측 NaN 유지 · 재분석/GFS복사 제거)]
+# [3. NASA GEOS-FP 순수 예보 수집기 (격자 캐시 + 10분 회로차단기)]
 # ==========================================
-_NASA_CACHE = {}
-
 _NASA_CACHE = {}
 _NASA_DOWN_UNTIL = 0.0
 
@@ -382,10 +368,6 @@ def _parse_opendap_ascii_1d(ascii_text, var_name):
     return vals
 
 def fetch_nasa_geos_forecast_only(lat, lon):
-    """
-    - 0.25도 격자(lat_idx, lon_idx) 단위 캐시로 제주 관측소 중복 호출 제거
-    - OpenDAP 전체 무응답 시 10분 회로 차단기로 3분 이상 타임아웃 지연 방지
-    """
     global _NASA_DOWN_UNTIL
     lat_idx, lon_idx = int(round((lat + 90.0) / 0.25)), int(round((lon + 180.0) / 0.25))
     ck = (lat_idx, lon_idx)
@@ -404,12 +386,7 @@ def fetch_nasa_geos_forecast_only(lat, lon):
         session.auth = (NASA_USER, NASA_PASS)
 
     now_utc = datetime.now(timezone.utc)
-    candidate_runs = [
-        (now_utc, "00"),
-        (now_utc - timedelta(days=1), "12")
-    ]
-
-    for run_dt, cyc in candidate_runs:
+    for run_dt, cyc in [(now_utc, "00"), (now_utc - timedelta(days=1), "12")]:
         ymd = run_dt.strftime("%Y%m%d")
         base = "https://opendap.nccs.nasa.gov/dods/GEOS-5/fp/0.25_deg/fcast"
         slv_u = f"{base}/tavg1_2d_slv_Nx/tavg1_2d_slv_Nx.{ymd}_{cyc}.ascii?t2m[0:1:119][{lat_idx}][{lon_idx}],u10m[0:1:119][{lat_idx}][{lon_idx}],v10m[0:1:119][{lat_idx}][{lon_idx}]"
@@ -573,13 +550,9 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key):
     return pd.DataFrame(), "관측 데이터 대기"
 
 # ==========================================
-# [5. v8.0 공정 4중 채점 (스무딩 + 상한선 + 결측 모델 동결)]
+# [5. v8.1 공정 4중 채점 (스무딩 + 상한선 + 결측 모델 동결)]
 # ==========================================
 def evaluate_4way_fair(df_eval, candidate_models, df_obs):
-    """
-    - 유효 대조 시간 12시간 이상인 모델만 정식 채점 (결측 모델은 scored=False로 기존 가중치 동결)
-    - 스무딩 상수(+0.12)와 일일 점유율 상한(25%)으로 맑은 날 Brier Score 폭등 차단
-    """
     metrics = {}
     scored_keys = []
 
@@ -615,7 +588,6 @@ def evaluate_4way_fair(df_eval, candidate_models, df_obs):
     if not scored_keys:
         return {}, metrics
 
-    # 스무딩 역오차 점수 (극단적 배율 폭주 차단)
     t_inv = {k: 1.0 / (metrics[k]['temp_mae'] + 0.50) for k in scored_keys}
     p_inv = {k: 1.0 / (metrics[k]['prob_brier'] + 0.12) for k in scored_keys}
     r_inv = {k: 1.0 / (metrics[k]['rain_mae'] + 0.30) for k in scored_keys}
@@ -634,14 +606,12 @@ def evaluate_4way_fair(df_eval, candidate_models, df_obs):
         metrics[k]['score_wind'] = round(score_w, 1)
         raw_daily[k] = (W_TEMP * score_t) + (W_PROB * score_p) + (W_RAIN * score_r) + (W_WIND * score_w)
 
-    # 일일 점유율 상/하한 적용 후 100% 정규화
     capped = {k: float(np.clip(v, DAILY_SCORE_FLOOR, DAILY_SCORE_CAP)) for k, v in raw_daily.items()}
     c_tot = max(1e-9, sum(capped.values()))
     daily_w = {k: round((v / c_tot) * 100.0, 2) for k, v in capped.items()}
     return daily_w, metrics
 
 def update_weights_fair(prev_weights, daily_weights, all_model_keys):
-    """채점된 모델끼리만 가중치 풀을 재분배하고, 미채점(결측) 모델은 기존 가중치를 그대로 동결"""
     eq_w = round(100.0 / max(1, len(all_model_keys)), 2)
     aligned_prev = {m: prev_weights.get(m, eq_w) for m in all_model_keys}
     p_tot = max(1e-9, sum(aligned_prev.values()))
@@ -661,7 +631,6 @@ def update_weights_fair(prev_weights, daily_weights, all_model_keys):
         else:
             new_w[m] = aligned_prev[m]
 
-    # 최종 누적 가중치 상/하한 안전장치 적용 후 100% 정규화
     bounded = {m: float(np.clip(v, FINAL_WEIGHT_FLOOR, FINAL_WEIGHT_CAP)) for m, v in new_w.items()}
     b_tot = max(1e-9, sum(bounded.values()))
     final_w = {m: round((v / b_tot) * 100.0, 2) for m, v in bounded.items()}
@@ -677,7 +646,7 @@ def write_audit_log(region, eval_date, status, eval_mode, obs_source, scored_cnt
     row.to_csv(AUDIT_LOG_FILE, mode='a' if os.path.exists(AUDIT_LOG_FILE) else 'w', header=not os.path.exists(AUDIT_LOG_FILE), index=False, encoding='utf-8-sig')
 
 # ==========================================
-# [6. v8.0 11대 모델 통합 파이프라인 (스냅샷 저장 + 정석 채점)]
+# [6. v8.1 11대 모델 통합 파이프라인]
 # ==========================================
 def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
     auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
@@ -725,7 +694,6 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
         "latency_ms": om_ms, "errors": 0 if not df_mod.empty else 1, "msg": om_msg
     }
 
-    # [11번째 모델] NASA GEOS-FP 순수 예보 호출 (결측 NaN 유지, GFS 복사 없음)
     if progress_cb:
         progress_cb(55, "🛰️ [2/4] 미국(NASA GEOS-FP) 순수 예보 호출 중...")
     df_nasa, nasa_sec, nasa_note, nasa_has_rain = fetch_nasa_geos_forecast_only(stn_info["lat"], stn_info["lon"])
@@ -751,7 +719,6 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
         if log_cb:
             log_cb(f"⚠️ [11/11] 미국(NASA GEOS) {nasa_note}")
 
-    # 오늘 최초 실행 시 오늘~내일 예보 원본을 JSON 스냅샷으로 고정 저장
     snap_saved_now = save_forecast_snapshot(matched_key, today_date, now_kst, df_mod, active_models)
 
     if progress_cb:
@@ -770,7 +737,6 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
             "df_future_all": pd.DataFrame(), "run_error_count": run_error_count + 1, "snap_saved_now": False
         }
 
-    # [핵심] 어제 채점 데이터 로드: 1순위 스냅샷 JSON, 2순위 임시 Open-Meteo past_days (NASA 제외)
     df_snap_y, eval_mode_msg = load_yesterday_snapshot(matched_key, yesterday_date)
     if not df_snap_y.empty:
         df_eval = df_snap_y
@@ -778,7 +744,6 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
     else:
         y_start, y_end = pd.Timestamp(yesterday_date), pd.Timestamp(yesterday_date) + pd.Timedelta(hours=23)
         df_eval = df_mod[(df_mod.index >= y_start) & (df_mod.index <= y_end)]
-        # 임시 past_days 구간에서는 순수 예보 아카이브가 없는 NASA를 채점 대상에서 자동 제외
         eval_candidates = [k for k in active_models.keys() if k != "nasa_geos_fp"]
 
     daily_weights, metrics = evaluate_4way_fair(df_eval, eval_candidates, df_obs_y)
@@ -811,7 +776,7 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
         }
         top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
         write_audit_log(matched_key, yesterday_str, "v8신규초기화", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
-        weight_status_msg = f"🆕 v8.0 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점, 미수신 모델 동결)"
+        weight_status_msg = f"🆕 v8.1 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점)"
     else:
         reg_data = history[matched_key]
         if reg_data.get("last_updated") != today_str:
@@ -906,55 +871,12 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None):
         "run_error_count": run_error_count, "snap_saved_now": snap_saved_now
     }
 
-# ==========================================
-# [7. 카카오톡 메시지 생성 및 양방향 처리]
-# ==========================================
-def format_kakao_weather_reply(res_data):
-    region_name = res_data["region_name"]
-    df_fut = res_data["df_future_all"]
-    if df_fut.empty or not res_data["cum_weights"]:
-        return f"⚠️ [{region_name}] 기상 서버 응답이 일시 지연 중입니다. 잠시 후 다시 시도해 주세요."
-    df_24h = df_fut.head(24)
-    sorted_w = sorted(res_data["cum_weights"].items(), key=lambda x: x[1], reverse=True)
-
-    top1_code, top1_w = sorted_w[0]
-    top1_name = MODELS.get(top1_code, {}).get("name", top1_code)
-    top1_m = res_data["metrics"].get(top1_code, {})
-    top1_diff = top1_w - res_data["prev_weights"].get(top1_code, 9.1)
-    top1_diff_str = f"▲+{top1_diff:.1f}%" if top1_diff >= 0 else f"▼{top1_diff:.1f}%"
-    top3_str = " / ".join([f"{rk}위 {MODELS.get(mc,{}).get('name',mc)}({fw:.1f}%)" for rk, (mc, fw) in enumerate(sorted_w[:3], 1)])
-
-    now_t, min_t, max_t = df_24h['Ensemble_Temp'].iloc[0], df_24h['Ensemble_Temp'].min(), df_24h['Ensemble_Temp'].max()
-    max_prob, sum_rain, max_wind, avg_conf = df_24h['Ensemble_Prob'].max(), df_24h['Ensemble_Rain'].sum(), df_24h['Ensemble_Wind'].max(), df_24h['Confidence'].mean()
-    rain_advice = f"☔ 24시간 내 약 {sum_rain:.1f}mm 비 예보(최대 {max_prob:.0f}%)" if (sum_rain >= 0.5 or max_prob >= 50) else f"☀️ 비 소식 없음 (확률 {max_prob:.0f}% 이하)"
-
-    lines_24h = []
-    for idx, row in df_24h.iloc[::3].iterrows():
-        r_lbl = f"🌧️{row['Ensemble_Rain']:.1f}mm({row['Ensemble_Prob']:.0f}%)" if row['Ensemble_Rain'] >= 0.1 else f"확률{row['Ensemble_Prob']:.0f}%"
-        lines_24h.append(f"• {idx.strftime('%d일 %H시')}: {row['Ensemble_Temp']:>4.1f}℃ | 💨{row['Ensemble_Wind']:.1f}m/s | {r_lbl}")
-
-    return (
-        f"🌴 [{region_name} v8.0 맞춤 브리핑 (확률90%·강수5%)]\n"
-        f"🕒 기준: {res_data['now_kst'].strftime('%m/%d %H:%M')}\n"
-        f"📸 채점: {res_data['eval_mode_msg']}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🏆 [1위 모델: {top1_name} ({top1_w:.1f}%, {top1_diff_str})]\n"
-        f"• 확률BS: {top1_m.get('prob_brier',0):.3f} | 강수MAE: ±{top1_m.get('rain_mae',0):.2f}mm\n"
-        f"• TOP3: {top3_str}\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🌤️ [향후 24시간 요약 (신뢰도 {avg_conf:.0f}%)]\n"
-        f"• 강수: {rain_advice}\n"
-        f"• 기온: 현재 {now_t:.1f}℃ ({min_t:.1f}℃ ~ {max_t:.1f}℃) | 최대풍속 {max_wind:.1f}m/s\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🕒 [3시간 간격 상세 예보]\n" + "\n".join(lines_24h)
-    )
-
-def format_kakao_status_reply():
+def format_status_report():
     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    sec_kma = "🔒암호화 연동됨" if KMA_AUTH_KEY else "⚠️미설정(Secrets 등록필요)"
+    sec_kma = f"🔒연동됨 (길이 {len(KMA_AUTH_KEY)}자)" if KMA_AUTH_KEY else "⚠️미설정(Secrets 등록필요)"
     api_lines = [f"• {k}: {v['status']} ({v['latency_ms']}ms) - {v['msg']}" for k, v in SYSTEM_HEALTH["api_status"].items()]
     snaps = list_saved_snapshots()
-    snap_txt = ", ".join(snaps) if snaps else "아직 저장된 스냅샷 없음 (Actions 1회 실행 필요)"
+    snap_txt = ", ".join(snaps) if snaps else "아직 저장된 스냅샷 없음"
 
     reg_lines = []
     if os.path.exists(WEIGHT_HISTORY_FILE):
@@ -963,99 +885,51 @@ def format_kakao_status_reply():
         for reg, info in list(history.items())[:16]:
             w_map = info.get("cumulative_weights", {})
             top_m, top_w = max(w_map.items(), key=lambda x: x[1]) if w_map else ("-", 0)
-            reg_lines.append(f"• {reg}({info.get('update_count',1)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | {info.get('eval_mode','-')[:14]}")
+            reg_lines.append(f"• {reg}({info.get('update_count',1)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | {info.get('obs_source','-')[:22]}")
 
     return (
-        f"🖥️ [제주 기상 앙상블 v8.0 상태 & 스냅샷 대시보드]\n"
+        f"🖥️ [제주 기상 앙상블 v8.1 상태 & 스냅샷 대시보드]\n"
         f"🕒 조회시각: {now_str} | 기상청키: {sec_kma}\n"
         f"⚖️ 가중치: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% (상한 30%)\n"
         f"📸 보관된 예보 스냅샷: {snap_txt}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📡 [1. API 통신 건전성]\n" + "\n".join(api_lines) + "\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"📍 [2. 지역별 1위 모델 현황]\n" + ("\n".join(reg_lines) if reg_lines else "• 지역명을 먼저 조회해 주세요.")
+        f"📍 [2. 지역별 1위 모델 & 관측소스]\n" + ("\n".join(reg_lines) if reg_lines else "• 지역명을 먼저 조회해 주세요.")
     )
 
-def handle_kakao_command(user_msg):
-    clean_msg = user_msg.strip()
-    if not clean_msg: return "🌴 제주 지역명(예: 서귀포, 애월, 함덕) 또는 '상태', '관측소'를 입력해 주세요."
-    if clean_msg in ["상태", "로그", "진단", "status"]: return format_kakao_status_reply()
-    if clean_msg in ["관측소", "목록", "지역"]:
-        auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
-        return f"📍 [검색 가능한 제주 관측소 ({len(JEJU_STATIONS)}곳)]\n" + ", ".join(JEJU_STATIONS.keys())
-    auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
-    matched_key = next((k for k in JEJU_STATIONS.keys() if k in clean_msg or clean_msg in k), None)
-    if matched_key: return format_kakao_weather_reply(run_station_pipeline(matched_key))
-    return f"⚠️ '{clean_msg}' 관측소를 찾을 수 없습니다."
-
-def send_kakao_memo_to_me(text_msg, rest_api_key, refresh_token):
-    if not rest_api_key or not refresh_token:
-        return False
-    try:
-        tk_res = requests.post(
-            "https://kauth.kakao.com/oauth/token",
-            data={"grant_type": "refresh_token", "client_id": rest_api_key, "refresh_token": refresh_token},
-            timeout=8
-        ).json()
-        access_token = tk_res.get("access_token")
-        if not access_token:
-            return False
-        template_obj = {
-            "object_type": "text", "text": text_msg[:1950],
-            "link": {"web_url": "https://smartydarong.streamlit.app", "mobile_web_url": "https://smartydarong.streamlit.app"},
-            "button_title": "모바일 대시보드 열기"
-        }
-        send_res = requests.post(
-            "https://kapi.kakao.com/v2/api/talk/memo/default/send",
-            headers={"Authorization": f"Bearer {access_token}"},
-            data={"template_object": json.dumps(template_obj)}, timeout=8
-        ).json()
-        return send_res.get("result_code") == 0
-    except Exception:
-        return False
-
 # ==========================================
-# [8. GitHub Actions 무인 배치 모드 (--auto-update)]
+# [7. GitHub Actions 무인 배치 모드 (--auto-update)]
 # ==========================================
 if "--auto-update" in sys.argv:
-    print("🚀 [무인 스케줄러 v8.0] 스냅샷 저장 + 익일 정석 채점 시작...")
+    print(f"🚀 [무인 스케줄러 v8.1] 시작 | KMA_AUTH_KEY 감지: {bool(KMA_AUTH_KEY)} (길이: {len(KMA_AUTH_KEY)}자)")
     auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
-    alert_res = None
     for idx, reg in enumerate(list(JEJU_STATIONS.keys())[:16], 1):
         try:
-            print(f" -> [{idx}/16] '{reg}' 스냅샷 저장 및 공정 채점 중...")
             r_obj = run_station_pipeline(reg)
-            if reg == ALERT_REGION:
-                alert_res = r_obj
+            print(f" -> [{idx:02d}/16] '{reg}' | 채점모델:{len(r_obj['daily_weights'])}개 | {r_obj['obs_source_msg']} | {r_obj['weight_status_msg']}")
             time.sleep(0.8)
         except Exception as e:
-            print(f" ⚠️ '{reg}' 예외 건너뜀: {e}")
-    if alert_res is not None:
-        send_kakao_memo_to_me(format_kakao_weather_reply(alert_res), KAKAO_REST_API_KEY, KAKAO_REFRESH_TOKEN)
-    print("✅ [무인 스케줄러 v8.0 완료]")
+            print(f" ⚠️ [{idx:02d}/16] '{reg}' 예외 발생: {e}")
+    print("✅ [무인 스케줄러 v8.1 완료]")
     sys.exit(0)
 
 # ==========================================
-# [9. 스마트폰 모바일 웹 앱 화면 (Streamlit UI)]
+# [8. 스마트폰 모바일 웹 앱 화면 (Streamlit UI)]
 # ==========================================
 import streamlit as st
 
-st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v8.0", page_icon="🌴", layout="wide")
+st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v8.1", page_icon="🌴", layout="wide")
 auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
 
-if "kakao_msg" in st.query_params:
-    st.code(handle_kakao_command(st.query_params["kakao_msg"]))
-    st.stop()
-
-st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v8.0 (스냅샷 정석 채점 · 공정 가중치)")
+st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v8.1 (스냅샷 정석 채점 · 공정 가중치)")
 st.caption("가중치: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% | 스냅샷 익일 대조 · 결측 동결 · 누적 상한 30%")
 
 if not KMA_AUTH_KEY:
     st.warning("⚠️ Streamlit Secrets에 `KMA_AUTH_KEY`가 등록되지 않아 기상청 실측 채점이 비활성화되었습니다. 우측 하단 Manage app → Settings → Secrets에 등록해 주세요.")
 
-tab_forecast, tab_kakao, tab_status = st.tabs([
+tab_forecast, tab_status = st.tabs([
     "🌤️ 지역별 맞춤 예보 (터치 조회)",
-    "💬 카카오톡 양방향 봇 채팅 & 연동",
     "🖥️ 스냅샷 · 다중 인자 상태 대시보드"
 ])
 
@@ -1086,7 +960,7 @@ with tab_forecast:
             )
             st.session_state["last_result"] = result
             st.session_state["last_region"] = selected_region
-            status_box.update(label=f"✅ [{selected_region}] v8.0 분석 완료!", state="complete", expanded=False)
+            status_box.update(label=f"✅ [{selected_region}] v8.1 분석 완료!", state="complete", expanded=False)
 
     res = st.session_state["last_result"]
     df_fut = res["df_future_all"]
@@ -1095,7 +969,7 @@ with tab_forecast:
     if df_24h.empty or not res["cum_weights"]:
         st.error(f"❌ **[{selected_region}] 기상 모델 데이터를 불러오지 못했습니다.** ({res['weight_status_msg']})")
         st.info("💡 10초 뒤 우측의 **[🔍 실시간 예보 & 채점 실행]** 버튼을 다시 눌러주세요.")
-        st.code(format_kakao_status_reply())
+        st.code(format_status_report())
     else:
         sorted_w = sorted(res["cum_weights"].items(), key=lambda x: x[1], reverse=True)
         top_m_code, top_m_w = sorted_w[0]
@@ -1164,22 +1038,6 @@ with tab_forecast:
                 })
             st.dataframe(pd.DataFrame(rows_7d), use_container_width=True, hide_index=True)
 
-with tab_kakao:
-    st.markdown("#### 💬 카카오톡 양방향 실시간 대화 테스트")
-    if "chat_history" not in st.session_state:
-        st.session_state["chat_history"] = [{"role": "assistant", "content": "안녕하세요! v8.0 스냅샷 정석 채점이 적용된 제주 기상 봇입니다. '함덕', '서귀포', '애월', '상태'를 입력해 보세요."}]
-    for chat in st.session_state["chat_history"]:
-        with st.chat_message(chat["role"]): st.text(chat["content"])
-    user_query = st.chat_input("메시지를 입력하세요 (예: 함덕, 서귀포, 애월, 상태)")
-    if user_query:
-        st.session_state["chat_history"].append({"role": "user", "content": user_query})
-        with st.chat_message("user"): st.text(user_query)
-        with st.chat_message("assistant"):
-            with st.spinner(f"'{user_query}' 실시간 계산 중..."):
-                bot_reply = handle_kakao_command(user_query)
-            st.text(bot_reply)
-        st.session_state["chat_history"].append({"role": "assistant", "content": bot_reply})
-
 with tab_status:
     st.markdown("#### 🖥️ 스냅샷 아카이브 · 다중 인자 상태 & 보안 대시보드")
-    st.code(format_kakao_status_reply())
+    st.code(format_status_report())
