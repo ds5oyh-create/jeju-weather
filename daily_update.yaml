@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: jeju-weather-daily-update
+  cancel-in-progress: false
+
 jobs:
   update-weights:
     runs-on: ubuntu-latest
@@ -23,17 +27,21 @@ jobs:
       - name: 3. 필수 라이브러리 설치
         run: pip install -r requirements.txt
 
-      - name: 4. 제주 16개 관측소 실측 채점 및 카카오톡 아침 브리핑 발송
+      - name: 4. 제주 16개 관측소 스냅샷 저장 및 실측 채점
         env:
+          KMA_AUTH_KEY: ${{ secrets.KMA_AUTH_KEY }}
           KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
           ALERT_REGION: "함덕"
         run: python app.py --auto-update
 
-      - name: 5. 갱신된 가중치 장부(JSON) 및 감사 로그(CSV) 저장
+      - name: 5. 갱신된 장부·스냅샷·감사 로그 안전 저장
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "JejuWeatherBot"
           git add jeju_weather_data/
-          git diff --staged --quiet || git commit -m "Auto-update daily ensemble weights"
-          git push
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-update daily ensemble weights and snapshots"
+            git pull --rebase --autostash origin main
+            git push origin main
+          fi
