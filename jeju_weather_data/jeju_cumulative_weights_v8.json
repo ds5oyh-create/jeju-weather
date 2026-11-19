@@ -47,58 +47,58 @@
       "ecmwf_ifs025": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 1.09,
-        "temp_bias": -1.04,
+        "temp_mae": 0.81,
+        "temp_bias": -0.43,
         "rain_mae": 0.23,
-        "prob_brier": 0.48,
-        "wind_mae": 5.87,
-        "wind_bias": 5.87,
-        "score_temp": 10.5,
-        "score_prob": 4.0,
-        "score_rain": 7.6,
-        "score_wind": 8.4
+        "prob_brier": 0.41,
+        "wind_mae": 3.9,
+        "wind_bias": 3.9,
+        "score_temp": 9.7,
+        "score_prob": 6.9,
+        "score_rain": 8.7,
+        "score_wind": 7.4
       },
       "ecmwf_ifs": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 1.39,
-        "temp_bias": -1.38,
-        "rain_mae": 0.31,
-        "prob_brier": 0.48,
-        "wind_mae": 4.78,
-        "wind_bias": 4.78,
-        "score_temp": 8.8,
-        "score_prob": 4.0,
-        "score_rain": 6.6,
-        "score_wind": 10.1
+        "temp_mae": 0.88,
+        "temp_bias": -0.77,
+        "rain_mae": 0.28,
+        "prob_brier": 0.41,
+        "wind_mae": 2.81,
+        "wind_bias": 2.81,
+        "score_temp": 9.2,
+        "score_prob": 6.9,
+        "score_rain": 7.9,
+        "score_wind": 9.9
       },
       "ecmwf_aifs025_single": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 1.26,
-        "temp_bias": 0.82,
-        "rain_mae": 0.16,
-        "prob_brier": 0.182,
-        "wind_mae": 5.74,
-        "wind_bias": 5.74,
-        "score_temp": 9.4,
-        "score_prob": 8.0,
-        "score_rain": 8.7,
-        "score_wind": 8.6
+        "temp_mae": 1.42,
+        "temp_bias": 1.42,
+        "rain_mae": 0.19,
+        "prob_brier": 0.232,
+        "wind_mae": 3.78,
+        "wind_bias": 3.78,
+        "score_temp": 6.6,
+        "score_prob": 10.5,
+        "score_rain": 9.4,
+        "score_wind": 7.6
       },
       "gfs_seamless": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 1.26,
-        "temp_bias": -1.07,
-        "rain_mae": 0.07,
-        "prob_brier": 0.247,
-        "wind_mae": 4.28,
-        "wind_bias": 4.28,
-        "score_temp": 9.4,
-        "score_prob": 6.6,
-        "score_rain": 10.8,
-        "score_wind": 11.2
+        "temp_mae": 0.51,
+        "temp_bias": -0.46,
+        "rain_mae": 0.12,
+        "prob_brier": 0.26,
+        "wind_mae": 2.32,
+        "wind_bias": 2.32,
+        "score_temp": 12.6,
+        "score_prob": 9.7,
+        "score_rain": 11.0,
+        "score_wind": 11.6
       },
       "nasa_geos_fp": {
         "scored": false,
@@ -117,100 +117,100 @@
       "icon_seamless": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 1.65,
-        "temp_bias": -1.63,
-        "rain_mae": 0.01,
-        "prob_brier": 0.001,
-        "wind_mae": 2.72,
-        "wind_bias": 2.7,
-        "score_temp": 7.7,
-        "score_prob": 20.1,
-        "score_rain": 12.9,
-        "score_wind": 16.6
+        "temp_mae": 1.03,
+        "temp_bias": -1.03,
+        "rain_mae": 0.11,
+        "prob_brier": 0.244,
+        "wind_mae": 1.17,
+        "wind_bias": 0.74,
+        "score_temp": 8.3,
+        "score_prob": 10.1,
+        "score_rain": 11.2,
+        "score_wind": 19.5
       },
       "ukmo_seamless": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 1.36,
-        "temp_bias": 0.96,
-        "rain_mae": 0.02,
-        "prob_brier": 0.109,
-        "wind_mae": 9.58,
-        "wind_bias": 9.58,
-        "score_temp": 8.9,
-        "score_prob": 10.6,
-        "score_rain": 12.5,
-        "score_wind": 5.3
+        "temp_mae": 1.57,
+        "temp_bias": 1.57,
+        "rain_mae": 0.11,
+        "prob_brier": 0.271,
+        "wind_mae": 7.62,
+        "wind_bias": 7.62,
+        "score_temp": 6.1,
+        "score_prob": 9.4,
+        "score_rain": 11.2,
+        "score_wind": 4.0
       },
       "jma_seamless": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 1.05,
-        "temp_bias": 0.3,
-        "rain_mae": 0.07,
-        "prob_brier": 0.101,
-        "wind_mae": 7.5,
-        "wind_bias": 7.5,
-        "score_temp": 10.7,
-        "score_prob": 11.0,
-        "score_rain": 10.8,
-        "score_wind": 6.7
+        "temp_mae": 0.91,
+        "temp_bias": 0.9,
+        "rain_mae": 0.15,
+        "prob_brier": 0.234,
+        "wind_mae": 5.54,
+        "wind_bias": 5.54,
+        "score_temp": 9.0,
+        "score_prob": 10.4,
+        "score_rain": 10.2,
+        "score_wind": 5.4
       },
       "cma_grapes_global": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 0.94,
-        "temp_bias": -0.02,
-        "rain_mae": 0.06,
-        "prob_brier": 0.103,
-        "wind_mae": 4.97,
-        "wind_bias": 4.97,
-        "score_temp": 11.5,
-        "score_prob": 10.9,
-        "score_rain": 11.1,
-        "score_wind": 9.8
+        "temp_mae": 0.74,
+        "temp_bias": 0.59,
+        "rain_mae": 0.12,
+        "prob_brier": 0.194,
+        "wind_mae": 3.0,
+        "wind_bias": 3.0,
+        "score_temp": 10.2,
+        "score_prob": 11.7,
+        "score_rain": 11.0,
+        "score_wind": 9.3
       },
       "meteofrance_seamless": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 0.9,
-        "temp_bias": -0.69,
-        "rain_mae": 0.07,
-        "prob_brier": 0.061,
-        "wind_mae": 3.81,
-        "wind_bias": 3.81,
-        "score_temp": 11.9,
-        "score_prob": 13.4,
-        "score_rain": 10.8,
-        "score_wind": 12.4
+        "temp_mae": 0.4,
+        "temp_bias": -0.08,
+        "rain_mae": 0.15,
+        "prob_brier": 0.18,
+        "wind_mae": 1.85,
+        "wind_bias": 1.85,
+        "score_temp": 14.1,
+        "score_prob": 12.3,
+        "score_rain": 10.2,
+        "score_wind": 13.9
       },
       "gem_seamless": {
         "scored": true,
         "eval_hours": 24,
-        "temp_mae": 1.0,
-        "temp_bias": -0.69,
-        "rain_mae": 0.19,
-        "prob_brier": 0.094,
-        "wind_mae": 4.32,
-        "wind_bias": 4.32,
-        "score_temp": 11.1,
-        "score_prob": 11.3,
-        "score_rain": 8.2,
-        "score_wind": 11.1
+        "temp_mae": 0.39,
+        "temp_bias": -0.08,
+        "rain_mae": 0.2,
+        "prob_brier": 0.185,
+        "wind_mae": 2.37,
+        "wind_bias": 2.36,
+        "score_temp": 14.2,
+        "score_prob": 12.1,
+        "score_rain": 9.2,
+        "score_wind": 11.4
       }
     },
-    "obs_source": "지점 780 (1.1 AWS 매분자료 직접 관측)",
+    "obs_source": "거리보간(제주 66%+성산 34% | AWS:ReadTimeout(15s초과))",
     "obs_summary": {
       "obs_hours": 24,
-      "temp_avg": 10.9,
-      "temp_min": 7.5,
-      "temp_max": 14.1,
-      "rain_sum": 0.0,
-      "wind_avg": 3.8,
-      "wind_max": 6.1
+      "temp_avg": 10.3,
+      "temp_min": 9.2,
+      "temp_max": 11.7,
+      "rain_sum": 2.4,
+      "wind_avg": 5.7,
+      "wind_max": 7.8
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 79.8
+    "avg_confidence_48h": 79.9
   },
   "제주": {
     "created_date": "2026-11-19",
@@ -636,7 +636,7 @@
       "wind_max": 4.2
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 82.4
+    "avg_confidence_48h": 82.5
   },
   "성산": {
     "created_date": "2026-11-19",
@@ -849,7 +849,7 @@
       "wind_max": 6.8
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 78.3
+    "avg_confidence_48h": 78.6
   },
   "고산": {
     "created_date": "2026-11-19",
@@ -1062,7 +1062,7 @@
       "wind_max": 21.0
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 81.5
+    "avg_confidence_48h": 81.6
   },
   "애월": {
     "created_date": "2026-11-19",
@@ -1264,7 +1264,7 @@
         "score_wind": 15.2
       }
     },
-    "obs_source": "지점 893 (1.1 AWS 매분자료 직접 관측)",
+    "obs_source": "지점 893 (1.1 AWS 매분자료 직접 관측·재시도성공)",
     "obs_summary": {
       "obs_hours": 24,
       "temp_avg": 11.0,
@@ -1275,7 +1275,7 @@
       "wind_max": 11.7
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 82.0
+    "avg_confidence_48h": 82.1
   },
   "구좌": {
     "created_date": "2026-11-19",
@@ -1468,7 +1468,7 @@
         "score_wind": 0.0
       }
     },
-    "obs_source": "지점 781 (1.1 AWS 매분자료 직접 관측)",
+    "obs_source": "지점 781 (1.1 AWS 매분자료 직접 관측·재시도성공)",
     "obs_summary": {
       "obs_hours": 24,
       "temp_avg": 10.3,
@@ -1479,7 +1479,7 @@
       "wind_max": 11.4
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 76.5
+    "avg_confidence_48h": 76.7
   },
   "한림": {
     "created_date": "2026-11-19",
@@ -1692,7 +1692,7 @@
       "wind_max": 7.3
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 81.9
+    "avg_confidence_48h": 82.0
   },
   "대정": {
     "created_date": "2026-11-19",
@@ -1905,7 +1905,7 @@
       "wind_max": 9.4
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 80.9
+    "avg_confidence_48h": 81.1
   },
   "중문": {
     "created_date": "2026-11-19",
@@ -2118,7 +2118,7 @@
       "wind_max": 7.6
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 81.5
+    "avg_confidence_48h": 81.6
   },
   "남원": {
     "created_date": "2026-11-19",
@@ -2331,7 +2331,7 @@
       "wind_max": 2.1
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 73.2
+    "avg_confidence_48h": 73.3
   },
   "표선": {
     "created_date": "2026-11-19",
@@ -2544,7 +2544,7 @@
       "wind_max": 8.1
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 73.0
+    "avg_confidence_48h": 73.2
   },
   "성판악": {
     "created_date": "2026-11-19",
@@ -2748,7 +2748,7 @@
       "wind_max": 6.2
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 66.7
+    "avg_confidence_48h": 66.8
   },
   "윗세오름": {
     "created_date": "2026-11-19",
@@ -3174,7 +3174,7 @@
       "wind_max": 5.2
     },
     "last_error_count": 0,
-    "avg_confidence_48h": 77.5
+    "avg_confidence_48h": 77.7
   },
   "추자도": {
     "created_date": "2026-11-19",
