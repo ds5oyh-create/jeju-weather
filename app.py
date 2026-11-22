@@ -16,7 +16,7 @@ import numpy as np
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# [0. 시크릿 로더 및 v8.5 기본 설정]
+# [0. 시크릿 로더 및 v8.6 기본 설정]
 # ==========================================
 def get_secret_key(key_name, default_val=""):
     val = os.environ.get(key_name, "")
@@ -120,7 +120,7 @@ def _record_kma_conn_failure(reason):
     return False
 
 SYSTEM_HEALTH = {
-    "storage_mode": "✅ v8.5 제주북부 기본 · 즐겨찾기 · 공개 AI 질답 · 스냅샷 정석 채점",
+    "storage_mode": "✅ v8.6 제주북부 기본 · 즐겨찾기 · 공개 AI 질답 · 스냅샷 정석 채점",
     "storage_path": SAVE_DIR,
     "total_error_count": 0,
     "last_check_time": "-",
@@ -860,7 +860,7 @@ def prefetch_kma_obs_batch(station_names, date_str, auth_key, max_workers=2):
     return time.time() - t0, asos_sec, asos_ok, aws_dir, aws_int, fail_logs, _is_kma_down()
 
 # ==========================================
-# [5. v8.5 공정 4중 채점]
+# [5. v8.6 공정 4중 채점]
 # ==========================================
 def evaluate_4way_fair(df_eval, candidate_models, df_obs):
     metrics, scored_keys = {}, []
@@ -930,7 +930,7 @@ def write_audit_log(region, eval_date, status, eval_mode, obs_source, scored_cnt
     row.to_csv(AUDIT_LOG_FILE, mode='a' if os.path.exists(AUDIT_LOG_FILE) else 'w', header=not os.path.exists(AUDIT_LOG_FILE), index=False, encoding='utf-8-sig')
 
 # ==========================================
-# [6. v8.5 통합 파이프라인]
+# [6. v8.6 통합 파이프라인]
 # ==========================================
 def run_station_pipeline(matched_key, progress_cb=None, log_cb=None, discover_stations=True):
     t_pipe_start = time.time()
@@ -1059,7 +1059,7 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None, discover_st
         top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
         if has_new_scores:
             write_audit_log(matched_key, yesterday_str, "v8신규초기화", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
-            weight_status_msg = f"🆕 v8.5 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점)"
+            weight_status_msg = f"🆕 v8.6 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점)"
         else:
             if is_batch_mode:
                 write_audit_log(matched_key, yesterday_str, "관측미수신(초기동결)", eval_mode_msg[:18], obs_source_msg, 0, run_error_count + 1, MODELS[top_m]["name"], top_w)
@@ -1198,7 +1198,6 @@ def build_forecast_context(res):
     )
 
 def answer_weather_rule_based(question, res):
-    """외부 API 키 미등록 또는 한도 초과 시 현재 예보 데이터로 직접 계산해 응답"""
     df_fut = res.get("df_future_all", pd.DataFrame())
     if df_fut.empty:
         return "현재 불러온 예보 데이터가 없어 답변할 수 없습니다. 예보 탭에서 먼저 지역을 조회해 주세요."
@@ -1266,42 +1265,78 @@ def ask_public_weather_ai(question, res, chat_history):
     )
 
     recent_hist = [m for m in chat_history[-6:] if m.get("role") in ("user", "assistant")]
+    ep_errors = []
 
-    # 1순위: Google Gemini API (서버 Secrets 키, 헤더 인증, URL에 키 미노출)
+    # 1순위: Google Gemini API (AI Studio 및 AQ. Express 엔드포인트 자동 대응)
     if GEMINI_API_KEY:
-        models_to_try = [CUSTOM_AI_MODEL] if (CUSTOM_AI_MODEL and "gemini" in CUSTOM_AI_MODEL.lower()) else ["gemini-3.8-flash", "gemini-2.5-flash"]
+        models_to_try = [CUSTOM_AI_MODEL] if (CUSTOM_AI_MODEL and "gemini" in CUSTOM_AI_MODEL.lower()) else [
+            "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"
+        ]
         contents = [{"role": ("model" if m["role"] == "assistant" else "user"), "parts": [{"text": m["content"][:800]}]} for m in recent_hist]
         contents.append({"role": "user", "parts": [{"text": question}]})
-        payload = {
-            "system_instruction": {"parts": [{"text": sys_prompt}]},
-            "contents": contents,
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 700}
-        }
-        for model_id in models_to_try:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
-                resp = requests.post(url, headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}, json=payload, timeout=(5, 20))
-                if resp.status_code == 200:
-                    data = resp.json()
-                    cands = data.get("candidates", [])
-                    if cands:
-                        parts = cands[0].get("content", {}).get("parts", [])
-                        ans = "".join(p.get("text", "") for p in parts).strip()
-                        if ans:
-                            return ans, f"Gemini ({model_id})"
-            except Exception:
-                continue
+        endpoints = [
+            ("Studio", "https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"),
+            ("Express", "https://aiplatform.googleapis.com/v1/publishers/google/models/{m}:generateContent")
+        ]
+
+        for ep_name, ep_tpl in endpoints:
+            ep_last = ""
+            for model_id in models_to_try:
+                base_payload = {
+                    "systemInstruction": {"parts": [{"text": sys_prompt}]},
+                    "contents": contents,
+                    "generationConfig": {
+                        "temperature": 0.3,
+                        "maxOutputTokens": 2048,
+                        "thinkingConfig": {"thinkingLevel": "LOW"}
+                    }
+                }
+                url = ep_tpl.format(m=model_id)
+                headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+                try:
+                    resp = requests.post(url, headers=headers, json=base_payload, timeout=(5, 25))
+                    if resp.status_code == 400 and "thinking" in resp.text.lower():
+                        base_payload["generationConfig"].pop("thinkingConfig", None)
+                        resp = requests.post(url, headers=headers, json=base_payload, timeout=(5, 25))
+
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        cands = data.get("candidates", [])
+                        if cands:
+                            parts = cands[0].get("content", {}).get("parts", [])
+                            ans = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+                            if ans:
+                                return ans, f"Gemini ({model_id})"
+                            ep_last = f"{ep_name}/{model_id}: 빈응답({cands[0].get('finishReason', 'UNKNOWN')})"
+                            continue
+
+                    err_tag = f"HTTP {resp.status_code}"
+                    try:
+                        st_name = resp.json().get("error", {}).get("status", "")
+                        if st_name:
+                            err_tag = f"HTTP {resp.status_code} {st_name}"
+                    except Exception:
+                        pass
+                    ep_last = f"{ep_name}/{model_id}: {err_tag}"
+                    if resp.status_code in (401, 403):
+                        break
+                except Exception as e:
+                    ep_last = f"{ep_name}/{model_id}: {type(e).__name__}"
+                    continue
+            if ep_last:
+                ep_errors.append(ep_last)
 
     # 2순위: Groq API (서버 Secrets 키, 무료 티어)
     if GROQ_API_KEY:
         models_to_try = [CUSTOM_AI_MODEL] if (CUSTOM_AI_MODEL and "gemini" not in CUSTOM_AI_MODEL.lower()) else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
         messages = [{"role": "system", "content": sys_prompt}] + [{"role": m["role"], "content": m["content"][:800]} for m in recent_hist] + [{"role": "user", "content": question}]
+        groq_last = ""
         for model_id in models_to_try:
             try:
                 resp = requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROQ_API_KEY}"},
-                    json={"model": model_id, "messages": messages, "temperature": 0.3, "max_tokens": 700},
+                    json={"model": model_id, "messages": messages, "temperature": 0.3, "max_tokens": 1024},
                     timeout=(5, 20)
                 )
                 if resp.status_code == 200:
@@ -1309,11 +1344,19 @@ def ask_public_weather_ai(question, res, chat_history):
                     ans = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                     if ans:
                         return ans, f"Groq ({model_id})"
-            except Exception:
+                groq_last = f"Groq/{model_id}: HTTP {resp.status_code}"
+            except Exception as e:
+                groq_last = f"Groq/{model_id}: {type(e).__name__}"
                 continue
+        if groq_last:
+            ep_errors.append(groq_last)
 
-    # 3순위: 외부 키 미설정 또는 일시 한도 초과 시 내장 규칙 기반 분석으로 안전 전환
-    fallback_note = "내장 규칙 분석 (외부 AI 한도 초과/지연 자동전환)" if (GEMINI_API_KEY or GROQ_API_KEY) else "내장 규칙 분석"
+    # 3순위: 외부 키 미설정 또는 호출 실패 시 내장 규칙 기반 분석으로 전환
+    if GEMINI_API_KEY or GROQ_API_KEY:
+        diag = " | ".join(ep_errors) if ep_errors else "응답지연"
+        fallback_note = f"내장 규칙 분석 (사유: {diag})"
+    else:
+        fallback_note = "내장 규칙 분석"
     return answer_weather_rule_based(question, res), fallback_note
 
 def format_status_report():
@@ -1334,7 +1377,7 @@ def format_status_report():
             reg_lines.append(f"• {reg}({info.get('update_count',0)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | {info.get('obs_source','-')[:28]}")
 
     return (
-        f"🖥️ [제주 기상 앙상블 v8.5 상태 & 스냅샷 대시보드]\n"
+        f"🖥️ [제주 기상 앙상블 v8.6 상태 & 스냅샷 대시보드]\n"
         f"🕒 조회시각: {now_str} | 기상청키: {sec_kma} | 기상청회로: {kma_cb_txt}\n"
         f"🤖 공개 AI 엔진: {get_active_ai_provider_label()}\n"
         f"⚖️ 가중치: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% (상한 30%)\n"
@@ -1355,7 +1398,7 @@ if "--auto-update" in sys.argv:
     target_stations = list(JEJU_STATIONS.keys())[:16]
     om_keys_batch = [k for k in MODELS.keys() if k != "nasa_geos_fp"]
 
-    print(f"🚀 [무인 스케줄러 v8.5] 시작 | KMA_AUTH_KEY 감지: {bool(KMA_AUTH_KEY)} (길이: {len(KMA_AUTH_KEY)}자)")
+    print(f"🚀 [무인 스케줄러 v8.6] 시작 | KMA_AUTH_KEY 감지: {bool(KMA_AUTH_KEY)} (길이: {len(KMA_AUTH_KEY)}자)")
     om_sec, om_ok, om_note = prefetch_open_meteo_batch(target_stations, om_keys_batch, past_days=2, now_kst=now_kst_batch, chunk_size=8)
     print(f"⏱️ [프리페치 1/2] Open-Meteo 다중좌표 일괄수집: {om_sec:.2f}s ({om_ok}/{len(target_stations)}개소 적재 | {om_note})")
 
@@ -1382,7 +1425,7 @@ if "--auto-update" in sys.argv:
         except Exception as e:
             print(f" ⚠️ [{idx:02d}/{len(target_stations)}] '{reg}' 예외 발생: {e}")
 
-    print(f"✅ [무인 스케줄러 v8.5 완료] 총 {time.time() - t_all0:.2f}s (OM배치 {om_sec:.2f}s + KMA수집 {kma_sec:.2f}s + NASA/채점 {time.time() - t_loop0:.2f}s | 신규스냅샷 {snap_cnt}개소)")
+    print(f"✅ [무인 스케줄러 v8.6 완료] 총 {time.time() - t_all0:.2f}s (OM배치 {om_sec:.2f}s + KMA수집 {kma_sec:.2f}s + NASA/채점 {time.time() - t_loop0:.2f}s | 신규스냅샷 {snap_cnt}개소)")
     sys.exit(0)
 
 # ==========================================
@@ -1390,10 +1433,9 @@ if "--auto-update" in sys.argv:
 # ==========================================
 import streamlit as st
 
-st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v8.5", page_icon="🌴", layout="wide")
+st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v8.6", page_icon="🌴", layout="wide")
 auto_discover_jeju_aws_stations(KMA_AUTH_KEY)
 
-# URL 쿼리 파라미터(?fav=...)와 연동되는 브라우저별 독립 즐겨찾기 초기화
 if "fav_stations" not in st.session_state:
     raw_fav = st.query_params.get("fav", "")
     st.session_state["fav_stations"] = [s for s in str(raw_fav).split(",") if s in JEJU_STATIONS]
@@ -1409,7 +1451,7 @@ def _sync_fav_query_params():
     elif "fav" in st.query_params:
         del st.query_params["fav"]
 
-st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v8.5")
+st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v8.6")
 st.caption("기본 관측소: 제주(북부) | 가중치: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% | 스냅샷 익일 정석 채점")
 
 tab_forecast, tab_ai, tab_status = st.tabs([
@@ -1421,7 +1463,6 @@ tab_forecast, tab_ai, tab_status = st.tabs([
 with tab_forecast:
     fav_stations = [s for s in st.session_state["fav_stations"] if s in JEJU_STATIONS]
 
-    # [최상단] 즐겨찾기 관측소 빠른 선택 바
     if fav_stations:
         st.markdown("**⭐ 즐겨찾기 관측소** *(북마크 시 현재 URL에 유지됩니다)*")
         cols_per_row = min(len(fav_stations), 6)
@@ -1433,7 +1474,6 @@ with tab_forecast:
                     st.session_state["active_region"] = f_reg
                     st.rerun()
 
-    # 드롭다운에서도 즐겨찾기 관측소를 최상단으로 자동 정렬
     ordered_stations = fav_stations + [s for s in JEJU_STATIONS.keys() if s not in fav_stations]
     curr_idx = ordered_stations.index(st.session_state["active_region"])
 
@@ -1481,7 +1521,7 @@ with tab_forecast:
             st.session_state["last_region"] = selected_region
             tm = result["timings"]
             status_box.update(
-                label=f"✅ [{selected_region}] v8.5 분석 완료! (총 {tm['total']:.2f}s — OM {tm['om']:.2f}s / NASA {tm['nasa']:.2f}s / KMA {tm['kma']:.2f}s)",
+                label=f"✅ [{selected_region}] v8.6 분석 완료! (총 {tm['total']:.2f}s — OM {tm['om']:.2f}s / NASA {tm['nasa']:.2f}s / KMA {tm['kma']:.2f}s)",
                 state="complete", expanded=False
             )
 
@@ -1594,9 +1634,11 @@ with tab_ai:
             st.session_state["ai_chat_history"] = []
             st.rerun()
 
-    for msg in st.session_state["ai_chat_history"]:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    chat_container = st.container()
+    with chat_container:
+        for msg in st.session_state["ai_chat_history"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
     typed_q = st.chat_input(f"[{curr_reg}] 예보에 대해 궁금한 점을 물어보세요 (최대 500자)")
     final_q = (triggered_q or typed_q or "").strip()[:500]
@@ -1609,13 +1651,14 @@ with tab_ai:
             st.warning("⚠️ 먼저 [🌤️ 지역별 맞춤 예보] 탭에서 관측소 예보를 불러온 뒤 질문해 주세요.")
         else:
             st.session_state["last_ai_ts"] = now_t
-            with st.chat_message("user"):
-                st.markdown(final_q)
-            with st.chat_message("assistant"):
-                with st.spinner("예보 데이터를 분석해 답변 생성 중..."):
-                    ans_text, engine_used = ask_public_weather_ai(final_q, res_ai, st.session_state["ai_chat_history"])
-                full_ans = f"{ans_text}\n\n<sub>기준: {curr_reg} 예보 · 엔진: {engine_used}</sub>"
-                st.markdown(full_ans, unsafe_allow_html=True)
+            with chat_container:
+                with st.chat_message("user"):
+                    st.markdown(final_q)
+                with st.chat_message("assistant"):
+                    with st.spinner("예보 데이터를 분석해 답변 생성 중..."):
+                        ans_text, engine_used = ask_public_weather_ai(final_q, res_ai, st.session_state["ai_chat_history"])
+                    full_ans = f"{ans_text}\n\n*기준: {curr_reg} 예보 · 엔진: {engine_used}*"
+                    st.markdown(full_ans)
             st.session_state["ai_chat_history"].append({"role": "user", "content": final_q})
             st.session_state["ai_chat_history"].append({"role": "assistant", "content": full_ans})
 
