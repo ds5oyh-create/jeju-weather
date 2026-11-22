@@ -244,20 +244,20 @@ def _calc_binary_skill(preds, actuals, beta=1.2):
     return fbeta, f1, rec, far
 
 def _optimize_thresholds_from_records(records, mode_label, min_wet):
-    """축적된 시간별 [prob, rain, yes_ratio, obs_rain, is_snap] 표본에서 최적 임계값을 탐색"""
+    """축적된 시간별 (ts, [prob, rain, yes_ratio, obs_rain, is_snap]) 표본에서 최적 임계값을 탐색"""
     if not records:
         return None
-    snap_recs = [r for r in records if len(r) >= 5 and r[4] == 1]
-    snap_days = len({ts[:10] for ts, r in snap_recs}) if snap_recs else 0
-    snap_wet = sum(1 for _, r in snap_recs if r[3] >= 0.1)
+    snap_recs = [(ts, v) for ts, v in records if len(v) >= 5 and v[4] == 1]
+    snap_days = len({ts[:10] for ts, _ in snap_recs}) if snap_recs else 0
+    snap_wet = sum(1 for _, v in snap_recs if v[3] >= 0.1)
     use_recs = snap_recs if (snap_days >= CAL_MIN_DAYS and snap_wet >= min_wet) else records
 
     days = len({ts[:10] for ts, _ in use_recs})
     hours = len(use_recs)
-    probs = np.array([r[0] for _, r in use_recs], dtype=float)
-    rains = np.array([r[1] for _, r in use_recs], dtype=float)
-    ratios = np.array([r[2] for _, r in use_recs], dtype=float)
-    obs_wet = np.array([r[3] >= 0.1 for _, r in use_recs], dtype=bool)
+    probs = np.array([v[0] for _, v in use_recs], dtype=float)
+    rains = np.array([v[1] for _, v in use_recs], dtype=float)
+    ratios = np.array([v[2] for _, v in use_recs], dtype=float)
+    obs_wet = np.array([v[3] >= 0.1 for _, v in use_recs], dtype=bool)
     wet_hours = int(np.sum(obs_wet))
 
     if days < CAL_MIN_DAYS or wet_hours < min_wet:
@@ -266,12 +266,12 @@ def _optimize_thresholds_from_records(records, mode_label, min_wet):
         return out
 
     # 1) 비 유력/유동적 기준 확률(prob_rain) 최적화 (F-beta, beta=1.2)
-    best_pr, best_pr_score, best_pr_stats = 50.0, -1.0, (0.0, 0.0, 0.0)
+    best_pr, best_pr_score = 50.0, -1.0
     for cand in [35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0]:
         pred = (probs >= cand) | (rains >= 0.5)
-        fb, f1, pod, far = _calc_binary_skill(pred, obs_wet, beta=1.2)
+        fb, _, _, _ = _calc_binary_skill(pred, obs_wet, beta=1.2)
         if fb > best_pr_score:
-            best_pr_score, best_pr, best_pr_stats = fb, cand, (f1, pod, far)
+            best_pr_score, best_pr = fb, cand
 
     # 2) 변덕주의 기준 확률(prob_watch) 최적화 (prob_rain보다 최소 10%p 낮게 유지, beta=1.6)
     best_pw, best_pw_score = min(30.0, best_pr - 15.0), -1.0
@@ -307,7 +307,6 @@ def _optimize_thresholds_from_records(records, mode_label, min_wet):
     final_yl = round(float(np.clip(best_yl * 0.7 + 0.60 * 0.3, 0.45, 0.70)), 2)
     final_yw = round(float(np.clip(best_yw * 0.7 + 0.30 * 0.3, 0.20, min(0.40, final_yl - 0.15))), 2)
 
-    # 최종 적용 임계값 기준 검증 지표 재계산
     final_pred = (probs >= final_pr) | (rains >= 0.5)
     _, f1, pod, far = _calc_binary_skill(final_pred, obs_wet, beta=1.2)
     src_tag = "스냅샷" if use_recs is snap_recs else "혼합표본"
@@ -333,12 +332,14 @@ def record_calibration_samples_and_update(region_name, df_eval, df_obs_y, eval_c
     is_snap = 1 if "스냅샷 정석 채점" in eval_mode_msg else 0
 
     if not df_eval.empty and not df_obs_y.empty:
-        common_idx = df_eval.index.intersection(df_obs_y.index)
+        df_e_uniq = df_eval[~df_eval.index.duplicated(keep='first')]
+        df_o_uniq = df_obs_y[~df_obs_y.index.duplicated(keep='first')]
+        common_idx = df_e_uniq.index.intersection(df_o_uniq.index)
         if len(common_idx) >= MIN_EVAL_HOURS:
             reg_map = samples_db.get(region_name, {})
             for ts in common_idx:
-                row_e = df_eval.loc[ts]
-                obs_r = float(df_obs_y.loc[ts, "obs_rain"])
+                row_e = df_e_uniq.loc[ts]
+                obs_r = float(df_o_uniq.loc[ts, "obs_rain"])
                 if pd.isna(obs_r):
                     continue
                 p_sum = p_w = r_sum = r_w = 0.0
@@ -361,7 +362,6 @@ def record_calibration_samples_and_update(region_name, df_eval, df_obs_y, eval_c
                     yr = round(r_yes / r_tot, 3)
                     ts_key = ts.strftime("%Y-%m-%d %H:%M")
                     prev = reg_map.get(ts_key)
-                    # 스냅샷 정석 표본은 임시 단기치 표본보다 우선 덮어쓰기
                     if prev is None or (is_snap == 1 and (len(prev) < 5 or prev[4] == 0)):
                         reg_map[ts_key] = [ep, er, yr, round(obs_r, 2), is_snap]
 
@@ -370,7 +370,6 @@ def record_calibration_samples_and_update(region_name, df_eval, df_obs_y, eval_c
             with open(CALIBRATION_SAMPLES_FILE, "w", encoding="utf-8") as f:
                 json.dump(samples_db, f, ensure_ascii=False, separators=(',', ':'))
 
-    # 제주 전체 통합 표본 + 지역별 표본에서 최적 임계값 계산
     global_recs = []
     for r_map in samples_db.values():
         for ts_k, vals in r_map.items():
@@ -729,7 +728,6 @@ def fetch_nasa_geos_forecast_only(lat, lon):
     t0 = time.time()
     session = requests.Session()
     now_utc = datetime.now(timezone.utc)
-    # 00Z 메인 런은 240시간(0..239) 보장이므로 오늘 -> 어제 -> 그제 00Z 순으로 조회
     candidates = [
         (now_utc, "00", 119),
         (now_utc - timedelta(days=1), "00", 143),
@@ -1205,7 +1203,7 @@ def write_audit_log(region, eval_date, status, eval_mode, obs_source, scored_cnt
     row.to_csv(AUDIT_LOG_FILE, mode='a' if os.path.exists(AUDIT_LOG_FILE) else 'w', header=not os.path.exists(AUDIT_LOG_FILE), index=False, encoding='utf-8-sig')
 
 # ==========================================
-# [6. v8.8 통합 파이프라인 (최적 임계값 자동보정 + NASA 복구)]
+# [6. v8.8 통합 파이프라인]
 # ==========================================
 def run_station_pipeline(matched_key, progress_cb=None, log_cb=None, discover_stations=True):
     t_pipe_start = time.time()
@@ -1362,7 +1360,6 @@ def run_station_pipeline(matched_key, progress_cb=None, log_cb=None, discover_st
     cum_weights = history[matched_key]["cumulative_weights"]
     prev_weights = history[matched_key]["prev_weights"]
 
-    # 최적 임계값 표본 기록 및 자동 보정 실행
     active_thresholds = record_calibration_samples_and_update(
         matched_key, df_eval, df_obs_y, eval_candidates, cum_weights, eval_mode_msg
     )
