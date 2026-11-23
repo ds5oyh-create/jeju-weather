@@ -17,7 +17,7 @@ import numpy as np
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# [0. 시크릿 로더 및 v9.0 기본 설정]
+# [0. 시크릿 로더 및 v9.1 기본 설정]
 # ==========================================
 def get_secret_key(key_name, default_val=""):
     val = os.environ.get(key_name, "")
@@ -76,6 +76,11 @@ CAL_MIN_GLOBAL_WET = 24
 CAL_KEEP_DAYS = 30
 SNAPSHOT_KEEP_DAYS = 10
 
+# 제주 전체(위도 33.00~34.00, 경도 126.25~126.875)를 덮는 NASA 0.25x0.3125 격자 범위 (5x3)
+NASA_JEJU_LAT_MIN, NASA_JEJU_LAT_MAX = 492, 496
+NASA_JEJU_LON_MIN, NASA_JEJU_LON_MAX = 980, 982
+NASA_DISK_CACHE_MAX_AGE_H = 24.0
+
 SAVE_DIR = "./jeju_weather_data"
 SNAPSHOT_DIR = os.path.join(SAVE_DIR, "forecast_snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
@@ -84,6 +89,7 @@ AUDIT_LOG_FILE = os.path.join(SAVE_DIR, "automation_audit_log_v8.csv")
 CALIBRATION_SAMPLES_FILE = os.path.join(SAVE_DIR, "threshold_calibration_samples_v8.json")
 OPTIMAL_THRESHOLDS_FILE = os.path.join(SAVE_DIR, "optimal_thresholds_v8.json")
 AWS_STATIONS_CACHE_FILE = os.path.join(SAVE_DIR, "jeju_aws_stations_cache.json")
+NASA_LATEST_CACHE_FILE = os.path.join(SAVE_DIR, "nasa_latest_cache.json")
 
 _LOCK = threading.Lock()
 _KMA_RATE_LOCK = threading.Lock()
@@ -94,7 +100,7 @@ _KMA_DOWN_UNTIL = 0.0
 _KMA_DOWN_REASON = ""
 _OM_SESSION = requests.Session()
 _OM_CACHE = {}
-_NASA_CACHE = {}
+_NASA_MEM_CACHE = {}
 _NASA_DOWN_UNTIL = 0.0
 _NASA_DOWN_REASON = ""
 _OBS_CACHE = {}
@@ -104,7 +110,7 @@ _DISCOVERED_NET = False
 def reset_runtime_caches():
     global _NASA_DOWN_UNTIL, _NASA_DOWN_REASON, _KMA_DOWN_UNTIL, _KMA_CONN_FAILS, _KMA_DOWN_REASON
     _OM_CACHE.clear()
-    _NASA_CACHE.clear()
+    _NASA_MEM_CACHE.clear()
     _NASA_DOWN_UNTIL = 0.0
     _NASA_DOWN_REASON = ""
     with _LOCK:
@@ -157,13 +163,13 @@ def _record_kma_conn_failure(reason):
     return False
 
 SYSTEM_HEALTH = {
-    "storage_mode": "✅ v9.0 전 관측소 스냅샷·채점 · 고속기동(NASA선택·AWS캐시) · 과거/타지역 AI질답",
+    "storage_mode": "✅ v9.1 NASA 단일경량·배치선행캐시(웹0초) · 전 관측소 스냅샷 · 과거/타지역 AI",
     "storage_path": SAVE_DIR,
     "total_error_count": 0,
     "last_check_time": "-",
     "api_status": {
         "Open-Meteo (10대 통합 NWP)": {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
-        "NASA GEOS-FP (선택 정밀)":   {"status": "⏸️ 선택대기", "code": "-", "latency_ms": 0, "errors": 0, "msg": "기본 OFF (토글 시 3h 경량조회)"},
+        "NASA GEOS-FP (단일캐시)":    {"status": "⏸️ 선택대기", "code": "-", "latency_ms": 0, "errors": 0, "msg": "기본 OFF (토글 시 배치캐시 0ms 로드)"},
         "KMA 1.1 (AWS 매분자료)":     {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
         "KMA 6.3 (AWS 지점일람표)":   {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "로컬캐시 우선(0ms)"},
         "KMA ASOS (종관기상관측)":    {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"}
@@ -527,7 +533,7 @@ def list_saved_snapshots():
     return summary
 
 # ==========================================
-# [2. Open-Meteo 다중 좌표 일괄 수집 (청크 간격 보호) + 단건 복구]
+# [2. Open-Meteo 다중 좌표 일괄 수집 + 단건 복구]
 # ==========================================
 _OM_HOURLY_VARS = "temperature_2m,precipitation_probability,precipitation,wind_speed_10m"
 
@@ -572,7 +578,6 @@ def prefetch_open_meteo_batch(station_names, om_keys, past_days, now_kst, chunk_
     cached_cnt, errors = 0, []
 
     for i in range(0, len(station_names), chunk_size):
-        # 전체 관측소 다중 청크 호출 시 HTTP 429 방지를 위한 간격 보호
         if i > 0 and chunk_delay > 0:
             time.sleep(chunk_delay)
         chunk = station_names[i:i + chunk_size]
@@ -689,11 +694,48 @@ def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst):
     return pd.DataFrame(), {}, {}, "❌ 통신실패", f"HTTP {last_code}: {last_reason}", ms, False
 
 # ==========================================
-# [3. NASA GEOS-FP 경량 수집기 (3h 스트라이드 + 1h 보간)]
+# [3. NASA GEOS-FP 단일 데이터셋(tavg1_2d_flx_Nx.latest) + 배치 선행 캐시(웹 0초)]
 # ==========================================
-def _parse_opendap_ascii_1d(ascii_text, var_name):
-    vals, capture = [], False
+_ENG_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+def _parse_gds_time_str(t_str):
+    """GrADS Data Server .das 시간 문자열(예: 09:30z21nov2026)을 UTC datetime으로 변환"""
+    m = re.match(r'^(\d{1,2})(?::(\d{2}))?z(\d{1,2})([a-zA-Z]{3})(\d{4})$', t_str.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2) or 0)
+    dd = int(m.group(3))
+    mon = _ENG_MONTHS.get(m.group(4).lower())
+    yyyy = int(m.group(5))
+    if not mon:
+        return None
+    try:
+        return datetime(yyyy, mon, dd, hh, mm, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+def _parse_das_time_bounds(das_text):
+    m_min = re.search(r'String\s+minimum\s+"([^"]+)"', das_text)
+    m_max = re.search(r'String\s+maximum\s+"([^"]+)"', das_text)
+    if not m_min or not m_max:
+        return None, None, 0
+    t_min = _parse_gds_time_str(m_min.group(1))
+    t_max = _parse_gds_time_str(m_max.group(1))
+    if not t_min or not t_max or t_max < t_min:
+        return None, None, 0
+    n_hours = int(round((t_max - t_min).total_seconds() / 3600.0)) + 1
+    return t_min, t_max, n_hours
+
+def _parse_opendap_ascii_3d(ascii_text, var_name):
+    """
+    OPeNDAP ASCII 3D Grid(var.var[T][Y][X])를 {(t_i, y_i, x_i): float} 딕셔너리로 파싱.
+    단일 지점([t][0][0], val)과 2D 슬라이스([t][y], v0, v1, v2)를 모두 처리.
+    """
+    data = {}
+    capture = False
     prefixes = (f"{var_name}.{var_name}", f"{var_name},", f"{var_name}[")
+    row_re = re.compile(r'^\[(\d+)\]\[(\d+)\](?:\[(\d+)\])?\s*,\s*(.+)$')
     for line in ascii_text.split('\n'):
         s = line.strip()
         if not s:
@@ -702,126 +744,290 @@ def _parse_opendap_ascii_1d(ascii_text, var_name):
             if s.startswith(prefixes):
                 capture = True
             continue
-        if s.startswith('['):
-            parts = [p.strip() for p in s.split(',')]
-            if len(parts) >= 2:
-                v = pd.to_numeric(parts[-1], errors='coerce')
-                vals.append(float(v) if (pd.notnull(v) and abs(float(v)) < 1e14) else np.nan)
-        elif vals:
+        m = row_re.match(s)
+        if m:
+            ti = int(m.group(1))
+            yi = int(m.group(2))
+            xi_fixed = int(m.group(3)) if m.group(3) is not None else None
+            vals_raw = [p.strip() for p in m.group(4).split(',')]
+            for j, vr in enumerate(vals_raw):
+                xi = xi_fixed if xi_fixed is not None else j
+                v = pd.to_numeric(vr, errors='coerce')
+                data[(ti, yi, xi)] = float(v) if (pd.notnull(v) and abs(float(v)) < 1e14) else np.nan
+        elif data:
             break
-    return vals
+    return data
 
-def _nasa_get(session, url, timeout=(4, 12)):
+def _nasa_get(session, url, timeout=(6, 20)):
     resp = session.get(url, timeout=timeout)
     if resp.status_code == 401 and NASA_USER and NASA_PASS:
         resp = session.get(url, auth=(NASA_USER, NASA_PASS), timeout=timeout)
     return resp
 
-def fetch_nasa_geos_forecast_only(lat, lon, read_timeout=12):
+def _nasa_grid_cell_for_coords(lat, lon):
+    lat_idx = int(np.clip(round((lat + 90.0) / 0.25), NASA_JEJU_LAT_MIN, NASA_JEJU_LAT_MAX))
+    lon_idx = int(np.clip(round((lon + 180.0) / 0.3125), NASA_JEJU_LON_MIN, NASA_JEJU_LON_MAX))
+    return lat_idx, lon_idx
+
+def _build_nasa_df_from_cell(times_iso, cell_dict):
+    """6시간 간격 캐시 배열을 1시간 간격 선형 보간 DataFrame으로 복원"""
+    if not times_iso or not cell_dict:
+        return pd.DataFrame(), False
+    t_arr = cell_dict.get("t", [])
+    p_arr = cell_dict.get("p", [])
+    w_arr = cell_dict.get("w", [])
+    if len(t_arr) != len(times_iso):
+        return pd.DataFrame(), False
+
+    rows = []
+    for ts_s, tv, pv, wv in zip(times_iso, t_arr, p_arr, w_arr):
+        if tv is not None:
+            rows.append({
+                "time": pd.to_datetime(ts_s),
+                "temperature_2m_nasa_geos_fp": float(tv),
+                "precipitation_nasa_geos_fp": float(pv) if pv is not None else np.nan,
+                "wind_speed_10m_nasa_geos_fp": float(wv) if wv is not None else np.nan
+            })
+    if len(rows) < 3:
+        return pd.DataFrame(), False
+
+    df_fc = pd.DataFrame(rows).set_index("time").sort_index()
+    has_rain = df_fc["precipitation_nasa_geos_fp"].notna().sum() >= 3
+    full_idx = pd.date_range(df_fc.index.min(), df_fc.index.max(), freq="1h")
+    df_fc = df_fc.reindex(full_idx)
+    df_fc["temperature_2m_nasa_geos_fp"] = df_fc["temperature_2m_nasa_geos_fp"].interpolate(method="linear", limit=6)
+    df_fc["wind_speed_10m_nasa_geos_fp"] = df_fc["wind_speed_10m_nasa_geos_fp"].interpolate(method="linear", limit=6).clip(lower=0.0)
+    if has_rain:
+        df_fc["precipitation_nasa_geos_fp"] = df_fc["precipitation_nasa_geos_fp"].interpolate(method="linear", limit=6).clip(lower=0.0)
+    df_fc["precipitation_probability_nasa_geos_fp"] = estimate_prob_from_rain(df_fc["precipitation_nasa_geos_fp"])
+    return df_fc, has_rain
+
+def load_nasa_from_disk_cache(lat, lon, max_age_hours=NASA_DISK_CACHE_MAX_AGE_H):
+    """jeju_weather_data/nasa_latest_cache.json에서 0ms로 NASA 격자 예보 로드"""
+    cache = _load_json_safe(NASA_LATEST_CACHE_FILE, {})
+    if not isinstance(cache, dict) or not cache.get("cells") or not cache.get("times"):
+        return pd.DataFrame(), "배치캐시 미생성", False, False
+
+    fetched_str = cache.get("fetched_at", "")
+    age_h = 999.0
+    if fetched_str:
+        try:
+            f_dt = datetime.strptime(fetched_str, "%Y-%m-%d %H:%M")
+            now_kst = datetime.now(KST).replace(tzinfo=None)
+            age_h = max(0.0, (now_kst - f_dt).total_seconds() / 3600.0)
+        except Exception:
+            age_h = 999.0
+
+    is_fresh = age_h <= max_age_hours
+    lat_idx, lon_idx = _nasa_grid_cell_for_coords(lat, lon)
+    cell_key = f"{lat_idx},{lon_idx}"
+    cell_dict = cache["cells"].get(cell_key)
+    if not cell_dict:
+        return pd.DataFrame(), f"캐시격자누락({cell_key})", False, False
+
+    df_fc, has_rain = _build_nasa_df_from_cell(cache["times"], cell_dict)
+    if df_fc.empty:
+        return pd.DataFrame(), "캐시데이터유효치부족", False, False
+
+    run_lbl = cache.get("run_label", "flx_Nx.latest")
+    note = f"배치캐시 0ms ({run_lbl}, 격자[{lat_idx},{lon_idx}], {age_h:.1f}h전 수집)"
+    return df_fc, note, has_rain, is_fresh
+
+def prefetch_nasa_jeju_grid_cache(read_timeout=60):
+    """
+    tavg1_2d_flx_Nx.latest 단일 데이터셋에서 제주 전체(5x3 격자)의
+    tlml(지상기온)·speed(풍속)·prectot(강수)를 6시간 간격(최대 13개 파일) 1회 요청으로 일괄 수집해
+    jeju_weather_data/nasa_latest_cache.json에 저장.
+    """
     global _NASA_DOWN_UNTIL, _NASA_DOWN_REASON
-    lat_idx = int(np.clip(round((lat + 90.0) / 0.25), 0, 720))
-    lon_idx = int(np.clip(round((lon + 180.0) / 0.3125), 0, 1151))
-    ck = (lat_idx, lon_idx)
-    now_ts = time.time()
-
-    if ck in _NASA_CACHE and (now_ts - _NASA_CACHE[ck]["ts"] < 900):
-        c = _NASA_CACHE[ck]
-        return c["df"].copy(), 0.0, c["note"], c["has_rain"]
-    if now_ts < _NASA_DOWN_UNTIL:
-        return pd.DataFrame(), 0.0, f"OpenDAP 일시차단({_NASA_DOWN_REASON or '10분대기'})", False
-
     t0 = time.time()
     session = requests.Session()
     now_utc = datetime.now(timezone.utc)
-    step = 3
+    step = 6
+
+    # 1순위: 공식 .latest 경로 (fcast/tavg1_2d_flx_Nx.latest), 단기런(33h)일 경우 최근 00Z/12Z로 자동 보완
+    base_fcast = "https://opendap.nccs.nasa.gov/dods/GEOS-5/fp/0.25_deg/fcast"
+    y0 = now_utc.strftime("%Y%m%d")
+    y1 = (now_utc - timedelta(days=1)).strftime("%Y%m%d")
     candidates = [
-        (now_utc, "00", 117),
-        (now_utc - timedelta(days=1), "00", 141)
+        ("flx_Nx.latest", f"{base_fcast}/tavg1_2d_flx_Nx.latest"),
+        (f"flx_Nx.{y0}_00Z", f"{base_fcast}/tavg1_2d_flx_Nx/tavg1_2d_flx_Nx.{y0}_00"),
+        (f"flx_Nx.{y1}_12Z", f"{base_fcast}/tavg1_2d_flx_Nx/tavg1_2d_flx_Nx.{y1}_12"),
+        (f"flx_Nx.{y1}_00Z", f"{base_fcast}/tavg1_2d_flx_Nx/tavg1_2d_flx_Nx.{y1}_00")
     ]
-    last_err = "데이터없음"
 
-    for run_dt, cyc, t_end in candidates:
-        ymd = run_dt.strftime("%Y%m%d")
-        base = "https://opendap.nccs.nasa.gov/dods/GEOS-5/fp/0.25_deg/fcast"
-        slv_u = f"{base}/tavg1_2d_slv_Nx/tavg1_2d_slv_Nx.{ymd}_{cyc}.ascii?t2m[0:{step}:{t_end}][{lat_idx}][{lon_idx}],u10m[0:{step}:{t_end}][{lat_idx}][{lon_idx}],v10m[0:{step}:{t_end}][{lat_idx}][{lon_idx}]"
-        flx_u = f"{base}/tavg1_2d_flx_Nx/tavg1_2d_flx_Nx.{ymd}_{cyc}.ascii?prectot[0:{step}:{t_end}][{lat_idx}][{lon_idx}]"
+    last_err = "유효런없음"
+    short_fallback = None
+    selected = None
+
+    # 1단계: 경량 .das 메타데이터(약 2KB)로 시작시각·예보길이 사전 확인
+    for label, ds_url in candidates:
         try:
-            r_s = _nasa_get(session, slv_u, timeout=(4, read_timeout))
-            if r_s.status_code != 200:
-                last_err = f"{ymd}_{cyc}Z HTTP {r_s.status_code}"
+            r_das = _nasa_get(session, f"{ds_url}.das", timeout=(6, 10))
+            if r_das.status_code != 200:
+                last_err = f"{label} DAS HTTP {r_das.status_code}"
                 continue
-            if "Error" in r_s.text[:250] or "t2m" not in r_s.text:
-                first_ln = r_s.text.strip().splitlines()[0][:50] if r_s.text.strip() else "빈응답"
-                last_err = f"{ymd}_{cyc}Z {first_ln}"
+            t_min, t_max, n_hours = _parse_das_time_bounds(r_das.text)
+            if not t_min or n_hours < 18:
+                last_err = f"{label} DAS 시간파싱실패"
                 continue
-
-            t_v = _parse_opendap_ascii_1d(r_s.text, "t2m")
-            u_v = _parse_opendap_ascii_1d(r_s.text, "u10m")
-            v_v = _parse_opendap_ascii_1d(r_s.text, "v10m")
-            if sum(pd.notnull(x) for x in t_v) < 8:
-                last_err = f"{ymd}_{cyc}Z t2m파싱({len(t_v)}건)"
-                continue
-
-            p_v, has_rain = [], False
-            try:
-                r_f = _nasa_get(session, flx_u, timeout=(4, read_timeout))
-                if r_f.status_code == 200 and "prectot" in r_f.text and "Error" not in r_f.text[:250]:
-                    p_v = _parse_opendap_ascii_1d(r_f.text, "prectot")
-                    has_rain = sum(pd.notnull(x) for x in p_v) >= 8
-            except Exception:
-                has_rain = False
-
-            st_kst = (datetime.strptime(f"{ymd}{cyc}", "%Y%m%d%H") + timedelta(hours=9)).replace(minute=0, second=0)
-            rows = []
-            for i, tk in enumerate(t_v):
-                if pd.notnull(tk) and 180.0 < tk < 340.0:
-                    uv = u_v[i] if i < len(u_v) and pd.notnull(u_v[i]) and abs(u_v[i]) < 200 else np.nan
-                    vv = v_v[i] if i < len(v_v) and pd.notnull(v_v[i]) and abs(v_v[i]) < 200 else np.nan
-                    ws_val = float(math.sqrt(uv**2 + vv**2)) if (pd.notnull(uv) and pd.notnull(vv)) else np.nan
-                    pr_mm = float(p_v[i] * 3600.0) if (has_rain and i < len(p_v) and pd.notnull(p_v[i]) and 0.0 <= p_v[i] < 10.0) else np.nan
-                    rows.append({
-                        "time": st_kst + timedelta(hours=i * step),
-                        "temperature_2m_nasa_geos_fp": float(tk - 273.15),
-                        "precipitation_nasa_geos_fp": pr_mm,
-                        "wind_speed_10m_nasa_geos_fp": ws_val
-                    })
-            if rows:
-                df_fc = pd.DataFrame(rows).set_index("time").sort_index()
-                full_idx = pd.date_range(df_fc.index.min(), df_fc.index.max(), freq="1h")
-                df_fc = df_fc.reindex(full_idx)
-                df_fc["temperature_2m_nasa_geos_fp"] = df_fc["temperature_2m_nasa_geos_fp"].interpolate(method="linear", limit=3)
-                df_fc["wind_speed_10m_nasa_geos_fp"] = df_fc["wind_speed_10m_nasa_geos_fp"].interpolate(method="linear", limit=3)
-                if has_rain:
-                    df_fc["precipitation_nasa_geos_fp"] = df_fc["precipitation_nasa_geos_fp"].interpolate(method="linear", limit=3).clip(lower=0.0)
-                df_fc["precipitation_probability_nasa_geos_fp"] = estimate_prob_from_rain(df_fc["precipitation_nasa_geos_fp"])
-
-                sec = time.time() - t0
-                note = f"GEOS-FP({ymd}_{cyc}Z 3h경량, 격자[{lat_idx},{lon_idx}], 강수{'정상' if has_rain else '미수신'})"
-                SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (선택 정밀)"] = {
-                    "status": "✅ 정상" if has_rain else "⚠️ 강수누락",
-                    "code": "200 OK", "latency_ms": int(sec * 1000),
-                    "errors": 0 if has_rain else 1, "msg": note
-                }
-                _NASA_CACHE[ck] = {"ts": now_ts, "df": df_fc, "sec": sec, "note": note, "has_rain": has_rain}
-                return df_fc, sec, note, has_rain
+            if n_hours >= 48:
+                selected = (label, ds_url, t_min, n_hours)
+                break
+            elif short_fallback is None:
+                short_fallback = (label, ds_url, t_min, n_hours)
         except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as e:
             last_err = f"연결차단({type(e).__name__})"
             break
         except requests.exceptions.ReadTimeout:
-            last_err = f"{ymd}_{cyc}Z ReadTimeout({read_timeout}s)"
+            last_err = f"{label} DAS ReadTimeout(10s)"
             continue
         except Exception as e:
-            last_err = f"{type(e).__name__}:{str(e)[:30]}"
+            last_err = f"{label} DAS {type(e).__name__}"
             continue
+
+    if selected is None and short_fallback is not None:
+        selected = short_fallback
+
+    if selected is None:
+        sec = time.time() - t0
+        _NASA_DOWN_UNTIL = time.time() + 600.0
+        _NASA_DOWN_REASON = last_err
+        SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (단일캐시)"] = {
+            "status": "⚠️ 미수신", "code": "ERR", "latency_ms": int(sec * 1000),
+            "errors": 1, "msg": f"실패사유: {last_err}"
+        }
+        return False, sec, f"미수신({last_err})"
+
+    # 2단계: 현재 시각 기준 72시간(6시간 간격 = 최대 13개 파일) 단일 ASCII 요청
+    label, ds_url, t_min_utc, n_hours = selected
+    hours_elapsed = int((now_utc - t_min_utc).total_seconds() // 3600)
+    t_start = max(0, min(hours_elapsed - 6, max(0, n_hours - 24)))
+    t_end = min(n_hours - 1, t_start + 72)
+    t_indices = list(range(t_start, t_end + 1, step))
+    if len(t_indices) < 3:
+        t_start, t_end = 0, min(n_hours - 1, 72)
+        t_indices = list(range(t_start, t_end + 1, step))
+
+    lat_s, lat_e = NASA_JEJU_LAT_MIN, NASA_JEJU_LAT_MAX
+    lon_s, lon_e = NASA_JEJU_LON_MIN, NASA_JEJU_LON_MAX
+    slice_str = f"[{t_start}:{step}:{t_end}][{lat_s}:1:{lat_e}][{lon_s}:1:{lon_e}]"
+    ascii_url = f"{ds_url}.ascii?tlml{slice_str},speed{slice_str},prectot{slice_str}"
+
+    try:
+        r_data = _nasa_get(session, ascii_url, timeout=(10, read_timeout))
+        if r_data.status_code != 200:
+            last_err = f"{label} HTTP {r_data.status_code}"
+        elif "Error" in r_data.text[:300] or "tlml" not in r_data.text:
+            first_ln = r_data.text.strip().splitlines()[0][:55] if r_data.text.strip() else "빈응답"
+            last_err = f"{label} {first_ln}"
+        else:
+            tlml_map = _parse_opendap_ascii_3d(r_data.text, "tlml")
+            spd_map = _parse_opendap_ascii_3d(r_data.text, "speed")
+            prc_map = _parse_opendap_ascii_3d(r_data.text, "prectot")
+
+            st_kst_base = (t_min_utc + timedelta(hours=9)).replace(tzinfo=None, minute=0, second=0, microsecond=0)
+            times_iso = [(st_kst_base + timedelta(hours=ti_abs)).strftime("%Y-%m-%d %H:%M") for ti_abs in t_indices]
+            n_y = lat_e - lat_s + 1
+            n_x = lon_e - lon_s + 1
+
+            cells = {}
+            valid_cells = 0
+            for yi in range(n_y):
+                for xi in range(n_x):
+                    t_vals, p_vals, w_vals = [], [], []
+                    ok_pts = 0
+                    for ti in range(len(t_indices)):
+                        tk = tlml_map.get((ti, yi, xi), np.nan)
+                        sp = spd_map.get((ti, yi, xi), np.nan)
+                        pr = prc_map.get((ti, yi, xi), np.nan)
+                        if pd.notnull(tk) and 180.0 < tk < 340.0:
+                            t_vals.append(round(float(tk - 273.15), 2))
+                            ok_pts += 1
+                        else:
+                            t_vals.append(None)
+                        w_vals.append(round(float(sp), 2) if (pd.notnull(sp) and 0.0 <= sp < 100.0) else None)
+                        p_vals.append(round(float(pr * 3600.0), 3) if (pd.notnull(pr) and 0.0 <= pr < 10.0) else None)
+                    if ok_pts >= 3:
+                        cells[f"{lat_s + yi},{lon_s + xi}"] = {"t": t_vals, "p": p_vals, "w": w_vals}
+                        valid_cells += 1
+
+            if valid_cells > 0:
+                sec = time.time() - t0
+                now_kst_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+                run_kst_str = st_kst_base.strftime("%m/%d %H시KST")
+                payload = {
+                    "fetched_at": now_kst_str,
+                    "run_label": f"{label} ({run_kst_str}기준, {len(t_indices)}스텝×6h)",
+                    "step_hours": step,
+                    "lat_range": [lat_s, lat_e],
+                    "lon_range": [lon_s, lon_e],
+                    "times": times_iso,
+                    "cells": cells
+                }
+                with open(NASA_LATEST_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
+                _NASA_MEM_CACHE.clear()
+                note = f"단일경량수집 성공 ({payload['run_label']}, {valid_cells}/15격자, {sec:.2f}s)"
+                SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (단일캐시)"] = {
+                    "status": "✅ 정상(캐시저장)", "code": "200 OK", "latency_ms": int(sec * 1000),
+                    "errors": 0, "msg": note
+                }
+                return True, sec, note
+            last_err = f"{label} 파싱유효격자 0건"
+    except requests.exceptions.ReadTimeout:
+        last_err = f"{label} ReadTimeout({read_timeout}s · {len(t_indices)}파일)"
+    except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as e:
+        last_err = f"연결차단({type(e).__name__})"
+    except Exception as e:
+        last_err = f"{type(e).__name__}:{str(e)[:35]}"
 
     sec = time.time() - t0
     _NASA_DOWN_UNTIL = time.time() + 600.0
     _NASA_DOWN_REASON = last_err
-    SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (선택 정밀)"] = {
+    SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (단일캐시)"] = {
         "status": "⚠️ 미수신", "code": "ERR", "latency_ms": int(sec * 1000),
-        "errors": 1, "msg": f"실패사유: {last_err} (10분 생략)"
+        "errors": 1, "msg": f"실패사유: {last_err}"
     }
-    return pd.DataFrame(), sec, f"미수신({last_err})", False
+    return False, sec, f"미수신({last_err})"
+
+def fetch_nasa_geos_forecast_only(lat, lon, allow_live_fallback=True, read_timeout=18):
+    """
+    1순위: 메모리/배치 디스크 캐시(nasa_latest_cache.json) 0초 로드
+    2순위: 캐시 미생성 또는 24시간 경과 시에만 단일 경량(tavg1_2d_flx_Nx.latest) 호출
+    """
+    lat_idx, lon_idx = _nasa_grid_cell_for_coords(lat, lon)
+    ck = (lat_idx, lon_idx)
+    now_ts = time.time()
+
+    if ck in _NASA_MEM_CACHE and (now_ts - _NASA_MEM_CACHE[ck]["ts"] < 900):
+        c = _NASA_MEM_CACHE[ck]
+        return c["df"].copy(), 0.0, c["note"], c["has_rain"]
+
+    df_disk, disk_note, disk_has_rain, disk_fresh = load_nasa_from_disk_cache(lat, lon)
+    if not df_disk.empty and disk_fresh:
+        SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (단일캐시)"] = {
+            "status": "✅ 캐시로드(0ms)", "code": "CACHE", "latency_ms": 0,
+            "errors": 0, "msg": disk_note
+        }
+        _NASA_MEM_CACHE[ck] = {"ts": now_ts, "df": df_disk, "note": disk_note, "has_rain": disk_has_rain}
+        return df_disk, 0.0, disk_note, disk_has_rain
+
+    if allow_live_fallback and now_ts >= _NASA_DOWN_UNTIL:
+        ok, sec, live_note = prefetch_nasa_jeju_grid_cache(read_timeout=read_timeout)
+        if ok:
+            df_new, new_note, new_has_rain, _ = load_nasa_from_disk_cache(lat, lon, max_age_hours=48.0)
+            if not df_new.empty:
+                _NASA_MEM_CACHE[ck] = {"ts": time.time(), "df": df_new, "note": new_note, "has_rain": new_has_rain}
+                return df_new, sec, f"실시간단일수집→캐시 ({live_note})", new_has_rain
+        # 실시간 보완 실패 시 24시간 지난 기존 캐시라도 유효하면 안전 대체
+        if not df_disk.empty:
+            return df_disk, sec, f"이전캐시 대체 ({disk_note} | 갱신실패:{live_note})", disk_has_rain
+        return pd.DataFrame(), sec, live_note, False
+
+    if not df_disk.empty:
+        return df_disk, 0.0, f"이전캐시 사용 ({disk_note})", disk_has_rain
+    return pd.DataFrame(), 0.0, f"미수신({_NASA_DOWN_REASON or disk_note})", False
 
 # ==========================================
 # [4. 기상청 AWS 로컬캐시(주 1회 갱신) + ASOS 일괄조회 + 회로차단기]
@@ -1181,7 +1387,7 @@ def prefetch_kma_obs_batch(station_names, date_str, auth_key, max_workers=2):
     return time.time() - t0, asos_sec, asos_ok, aws_dir, aws_int, fail_logs, _is_kma_down()
 
 # ==========================================
-# [5. v9.0 공정 4중 채점]
+# [5. v9.1 공정 4중 채점]
 # ==========================================
 def evaluate_4way_fair(df_eval, candidate_models, df_obs):
     metrics, scored_keys = {}, []
@@ -1295,9 +1501,11 @@ def _synthesize_ensemble_df(df_mod, model_keys, cum_weights, metrics, active_thr
     return out
 
 # ==========================================
-# [6. v9.0 통합 파이프라인 (NASA 기본 OFF / 선택 ON)]
+# [6. v9.1 통합 파이프라인 (NASA 기본 OFF / 토글 시 배치캐시 0초 로드)]
 # ==========================================
-def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=True, progress_cb=None, log_cb=None):
+def run_station_pipeline(
+    matched_key, include_nasa=False, allow_nasa_live=True, recompute_global_cal=True, progress_cb=None, log_cb=None
+):
     t_pipe_start = time.time()
     is_batch_mode = "--auto-update" in sys.argv
     load_cached_jeju_aws_stations()
@@ -1337,12 +1545,13 @@ def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=T
         "msg": f"{om_msg}{' (배치캐시)' if om_cached else ''}"
     }
 
-    nasa_sec, nasa_note, nasa_loaded = 0.0, "기본 미사용 (토글 시 합산)", False
+    nasa_sec, nasa_note, nasa_loaded = 0.0, "기본 미사용 (토글 시 배치캐시 0ms 로드)", False
     if include_nasa:
         if progress_cb:
-            progress_cb(50, "🛰️ [2/4] NASA GEOS-FP 정밀 예보(3h 경량) 호출 중...")
-        read_to = 20 if is_batch_mode else 12
-        df_nasa, nasa_sec, nasa_note, nasa_has_rain = fetch_nasa_geos_forecast_only(stn_info["lat"], stn_info["lon"], read_timeout=read_to)
+            progress_cb(50, "🛰️ [2/4] NASA GEOS-FP 배치캐시 로드 중...")
+        df_nasa, nasa_sec, nasa_note, nasa_has_rain = fetch_nasa_geos_forecast_only(
+            stn_info["lat"], stn_info["lon"], allow_live_fallback=allow_nasa_live, read_timeout=18
+        )
         if not df_nasa.empty and not df_mod.empty:
             df_na = df_nasa.reindex(df_mod.index)
             nasa_fh = int(df_na[df_na.index >= now_kst]["temperature_2m_nasa_geos_fp"].notna().sum())
@@ -1355,6 +1564,9 @@ def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=T
                 SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": "✅ 사용중" if nasa_has_rain else "⚠️ 강수누락", "max_hours": nasa_fh, "latency_s": round(nasa_sec, 2), "note": nasa_note}
                 if log_cb:
                     log_cb(f"✔ [11/11] 미국(NASA GEOS) 합산 완료 ({nasa_fh}h, {nasa_note})")
+            else:
+                nasa_note = f"유효미래시간 부족({nasa_fh}h)"
+                SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": "⚠️ 시간부족", "max_hours": nasa_fh, "latency_s": round(nasa_sec, 2), "note": nasa_note}
         else:
             SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": "⚠️ 미수신(제외)", "max_hours": 0, "latency_s": round(nasa_sec, 2), "note": nasa_note}
             if log_cb:
@@ -1425,7 +1637,7 @@ def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=T
         top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
         if has_new_scores:
             write_audit_log(matched_key, yesterday_str, "v8신규초기화", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
-            weight_status_msg = f"🆕 v9.0 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점)"
+            weight_status_msg = f"🆕 v9.1 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점)"
         else:
             if is_batch_mode:
                 write_audit_log(matched_key, yesterday_str, "관측미수신(초기동결)", eval_mode_msg[:18], obs_source_msg, 0, run_error_count + 1, MODELS[top_m]["name"], top_w)
@@ -1485,7 +1697,8 @@ def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=T
                 "base_sum_rain": round(float(df_base_24["Ensemble_Rain"].sum()), 1),
                 "full_sum_rain": round(float(df_full_24["Ensemble_Rain"].sum()), 1),
                 "base_tag": get_dominant_action_tag(df_base_24["Action_Tag"]),
-                "full_tag": get_dominant_action_tag(df_full_24["Action_Tag"])
+                "full_tag": get_dominant_action_tag(df_full_24["Action_Tag"]),
+                "nasa_note": nasa_note
             }
 
     history[matched_key]["avg_rain_consensus_48h"] = round(float(df_future_all.head(48)['Rain_Consensus'].mean()), 1) if not df_future_all.empty else 0.0
@@ -1879,6 +2092,12 @@ def format_status_report():
     snaps = list_saved_snapshots()
     snap_txt = ", ".join(snaps) if snaps else "아직 저장된 스냅샷 없음"
 
+    nasa_cache = _load_json_safe(NASA_LATEST_CACHE_FILE, {})
+    if isinstance(nasa_cache, dict) and nasa_cache.get("cells"):
+        nasa_cache_line = f"{nasa_cache.get('run_label', '-')} | 수집 {nasa_cache.get('fetched_at', '-')} | {len(nasa_cache['cells'])}/15격자"
+    else:
+        nasa_cache_line = "미생성 (새벽 배치 또는 상태 탭 수동 갱신 필요)"
+
     th_cfg = _load_json_safe(OPTIMAL_THRESHOLDS_FILE, {})
     g_th = th_cfg.get("global", DEFAULT_THRESHOLDS)
     th_line = (
@@ -1902,9 +2121,10 @@ def format_status_report():
             reg_lines.append(f"• {reg}({info.get('update_count',0)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | {info.get('obs_source','-')[:32]}")
 
     return (
-        f"🖥️ [제주 기상 앙상블 v9.0 상태 & 임계값 보정 대시보드]\n"
+        f"🖥️ [제주 기상 앙상블 v9.1 상태 & 임계값 보정 대시보드]\n"
         f"🕒 조회시각: {now_str} | 기상청키: {sec_kma} | 기상청회로: {kma_cb_txt} | 등록관측소: {len(JEJU_STATIONS)}개소\n"
         f"🤖 공개 AI 엔진: {get_active_ai_provider_label()}\n"
+        f"🛰️ NASA 선행캐시(nasa_latest_cache.json): {nasa_cache_line}\n"
         f"🎯 4단계 임계값(제주통합): {th_line}\n"
         f"⚖️ 가중치: 강수확률 90% + 강수량 5% + 기온 2.5% + 풍속 2.5% (상한 30%)\n"
         f"📸 보관된 예보 스냅샷({SNAPSHOT_KEEP_DAYS}일 보관): {snap_txt}\n"
@@ -1915,7 +2135,7 @@ def format_status_report():
     )
 
 # ==========================================
-# [8. GitHub Actions 무인 배치 모드 (--auto-update, 전체 관측소 대상)]
+# [8. GitHub Actions 무인 배치 모드 (--auto-update, 전체 관측소 + NASA 선행캐시 1회)]
 # ==========================================
 if "--auto-update" in sys.argv:
     t_all0 = time.time()
@@ -1923,17 +2143,20 @@ if "--auto-update" in sys.argv:
     yesterday_str_batch = (now_kst_batch.date() - timedelta(days=1)).strftime("%Y%m%d")
     om_keys_batch = [k for k in MODELS.keys() if k != "nasa_geos_fp"]
 
-    print(f"🚀 [무인 스케줄러 v9.0] 시작 | KMA_AUTH_KEY 감지: {bool(KMA_AUTH_KEY)} (길이: {len(KMA_AUTH_KEY)}자)")
-    # 1) 주소록 캐시 로드 및 주 1회 동기화 먼저 실행 → 확장 AWS 포함 전체 관측소 대상으로 설정
+    print(f"🚀 [무인 스케줄러 v9.1] 시작 | KMA_AUTH_KEY 감지: {bool(KMA_AUTH_KEY)} (길이: {len(KMA_AUTH_KEY)}자)")
     aws_ext_cnt = auto_discover_jeju_aws_stations(KMA_AUTH_KEY, allow_network=True)
     target_stations = list(JEJU_STATIONS.keys())
     print(f"📍 [수집 대상] 전체 {len(target_stations)}개소 (핵심 {len(CORE_STATION_NAMES)} + 확장 {aws_ext_cnt} | KMA 6.3 주 1회 캐시)")
 
-    # 2) Open-Meteo 전체 관측소 다중 청크 수집 (청크 간 1초 간격으로 HTTP 429 방지)
+    # 1) Open-Meteo 전체 관측소 다중 청크 수집 (청크 간 1초 간격)
     om_sec, om_ok, om_note = prefetch_open_meteo_batch(
         target_stations, om_keys_batch, past_days=2, now_kst=now_kst_batch, chunk_size=8, chunk_delay=1.0
     )
-    print(f"⏱️ [프리페치 1/2] Open-Meteo 다중좌표 일괄수집: {om_sec:.2f}s ({om_ok}/{len(target_stations)}개소 적재 | {om_note})")
+    print(f"⏱️ [프리페치 1/3] Open-Meteo 다중좌표 일괄수집: {om_sec:.2f}s ({om_ok}/{len(target_stations)}개소 적재 | {om_note})")
+
+    # 2) NASA GEOS-FP 제주 5x3 격자 단일 경량 요청(tavg1_2d_flx_Nx.latest, 6h×13스텝, 60초 타임아웃) 1회 선행 수집
+    nasa_ok_batch, nasa_batch_sec, nasa_batch_msg = prefetch_nasa_jeju_grid_cache(read_timeout=60)
+    print(f"⏱️ [프리페치 2/3] NASA GEOS-FP 제주격자 선행캐시: {nasa_batch_sec:.2f}s | {nasa_batch_msg}")
 
     # 3) 기상청 ASOS 1회 일괄 + 전체 AWS 2스레드 수집
     kma_sec, asos_sec, asos_ok, aws_dir, aws_int, aws_fails, kma_tripped = prefetch_kma_obs_batch(
@@ -1941,7 +2164,7 @@ if "--auto-update" in sys.argv:
     )
     aws_total = sum(1 for n in target_stations if JEJU_STATIONS[n]["type"] != "ASOS")
     cb_badge = " | ⛔ 회로차단 작동(남은 호출 생략)" if kma_tripped else ""
-    print(f"⏱️ [프리페치 2/2] 기상청 어제({yesterday_str_batch}) 실측수집: {kma_sec:.2f}s (ASOS 1회일괄 {asos_ok}/4개소 {asos_sec:.2f}s + AWS 직접 {aws_dir}/{aws_total} · 보간 {aws_int}/{aws_total}){cb_badge}")
+    print(f"⏱️ [프리페치 3/3] 기상청 어제({yesterday_str_batch}) 실측수집: {kma_sec:.2f}s (ASOS 1회일괄 {asos_ok}/4개소 {asos_sec:.2f}s + AWS 직접 {aws_dir}/{aws_total} · 보간 {aws_int}/{aws_total}){cb_badge}")
     if aws_fails:
         print(f"⚠️ [기상청 관측 보간/실패 진단 ({len(aws_fails)}개소)]")
         for f_reg, f_stn, f_sec, f_msg in aws_fails[:20]:
@@ -1950,25 +2173,27 @@ if "--auto-update" in sys.argv:
         if len(aws_fails) > 20:
             print(f"   ... 외 {len(aws_fails) - 20}개소 생략")
 
+    # 4) 전 관측소 스냅샷 저장 및 실측 채점 (NASA는 선행캐시에서 0.00s 로드, 실시간 재호출 없음)
     t_loop0, snap_cnt, last_th = time.time(), 0, DEFAULT_THRESHOLDS
     total_n = len(target_stations)
     for idx, reg in enumerate(target_stations, 1):
         try:
-            # 전체 통합 임계값 최적화는 마지막 관측소에서 1회 일괄 산출해 I/O 부하 최소화
-            r_obj = run_station_pipeline(reg, include_nasa=True, recompute_global_cal=(idx == total_n))
+            r_obj = run_station_pipeline(
+                reg, include_nasa=True, allow_nasa_live=False, recompute_global_cal=(idx == total_n)
+            )
             if r_obj.get("snap_saved_now"):
                 snap_cnt += 1
             last_th = r_obj.get("thresholds", last_th)
             nasa_ok = "NASA:OK" if r_obj.get("nasa_loaded") else "NASA:미수신"
             tm = r_obj["timings"]
-            print(f" -> [{idx:02d}/{total_n}] '{reg}' | OM:{r_obj['loaded_om_cnt']}/10 {nasa_ok} | 채점:{len(r_obj['daily_weights'])}개 | 소요 {tm['total']:.2f}s (NASA:{tm['nasa']:.2f}s) | {r_obj['obs_source_msg']}")
+            print(f" -> [{idx:02d}/{total_n}] '{reg}' | OM:{r_obj['loaded_om_cnt']}/10 {nasa_ok} | 채점:{len(r_obj['daily_weights'])}개 | 소요 {tm['total']:.2f}s | {r_obj['obs_source_msg']}")
         except Exception as e:
             print(f" ⚠️ [{idx:02d}/{total_n}] '{reg}' 예외 발생: {e}")
 
-    nasa_st = SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (선택 정밀)"]
+    nasa_st = SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (단일캐시)"]
     print(f"🛰️ [NASA 상태] {nasa_st['status']} ({nasa_st['latency_ms']}ms) - {nasa_st['msg']}")
     print(f"🎯 [임계값 보정] {last_th['mode']} | 표본 {last_th['days']}/{CAL_MIN_DAYS}일 · 강수 {last_th['wet_hours']}h | 확률 {last_th['prob_watch']:.0f}%/{last_th['prob_rain']:.0f}% · 합의 {int(last_th['yes_watch_ratio']*100)}%/{int(last_th['yes_likely_ratio']*100)}%")
-    print(f"✅ [무인 스케줄러 v9.0 완료] 총 {time.time() - t_all0:.2f}s (OM배치 {om_sec:.2f}s + KMA수집 {kma_sec:.2f}s + NASA/채점 {time.time() - t_loop0:.2f}s | 신규스냅샷 {snap_cnt}/{total_n}개소)")
+    print(f"✅ [무인 스케줄러 v9.1 완료] 총 {time.time() - t_all0:.2f}s (OM {om_sec:.2f}s + NASA캐시 {nasa_batch_sec:.2f}s + KMA {kma_sec:.2f}s + 채점 {time.time() - t_loop0:.2f}s | 신규스냅샷 {snap_cnt}/{total_n}개소)")
     sys.exit(0)
 
 # ==========================================
@@ -1976,7 +2201,7 @@ if "--auto-update" in sys.argv:
 # ==========================================
 import streamlit as st
 
-st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v9.0", page_icon="🌴", layout="wide")
+st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v9.1", page_icon="🌴", layout="wide")
 load_cached_jeju_aws_stations()
 
 st.markdown(
@@ -2011,8 +2236,8 @@ def _sync_fav_query_params():
     elif "fav" in st.query_params:
         del st.query_params["fav"]
 
-st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v9.0")
-st.caption("전 관측소 스냅샷·채점 · 고속 10대 기본 · NASA 정밀 토글 · 최적 임계값 자동보정 · 과거/타지역 AI 질답")
+st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v9.1")
+st.caption("전 관측소 스냅샷·채점 · 고속 10대 기본 · NASA 배치캐시 0초 정밀 합산 · 과거/타지역 AI 질답")
 
 tab_forecast, tab_ai, tab_status = st.tabs([
     "🌤️ 지역별 맞춤 예보",
@@ -2066,7 +2291,7 @@ with tab_forecast:
         run_clicked = st.button("🔍 새로고침", type="primary", use_container_width=True)
 
     include_nasa = st.toggle(
-        "🛰️ NASA GEOS-FP 가중치 포함 정밀 결과 보기 (기본 OFF · 켜면 NASA 3h 경량 데이터를 추가 합산)",
+        "🛰️ NASA GEOS-FP 가중치 포함 정밀 결과 보기 (기본 OFF · 켜면 배치 선행 캐시에서 즉시 합산)",
         value=False,
         key="nasa_precision_toggle"
     )
@@ -2089,6 +2314,7 @@ with tab_forecast:
             result = run_station_pipeline(
                 selected_region,
                 include_nasa=include_nasa,
+                allow_nasa_live=True,
                 progress_cb=lambda pct, txt: p_bar.progress(min(100, pct), text=txt),
                 log_cb=lambda msg: (logs.append(msg), log_box.code("\n".join(logs[-6:])))
             )
@@ -2129,13 +2355,13 @@ with tab_forecast:
             if cmp:
                 verify_txt = "실측 검증 가중치" if cmp["nasa_scored"] else "초기/누적 가중치"
                 st.info(
-                    f"🛰️ **NASA GEOS-FP 정밀 합산 적용** (NASA 비중 {cmp['nasa_weight']}% · {verify_txt}) | "
+                    f"🛰️ **NASA GEOS-FP 정밀 합산 적용** ({cmp['nasa_note']} · NASA 비중 {cmp['nasa_weight']}% · {verify_txt}) | "
                     f"24h 최대확률: 10대 기본 **{cmp['base_max_prob']:.0f}%** → NASA 합산 **{cmp['full_max_prob']:.0f}%** | "
                     f"누적강수: **{cmp['base_sum_rain']:.1f}mm** → **{cmp['full_sum_rain']:.1f}mm** | "
                     f"판단: {cmp['base_tag']} → {cmp['full_tag']}"
                 )
             else:
-                st.warning(f"🛰️ NASA GEOS-FP 수신 실패로 10대 기본 결과가 표시됩니다. ({res.get('nasa_note', '-')})")
+                st.warning(f"🛰️ NASA GEOS-FP 미수신으로 10대 기본 결과가 표시됩니다. ({res.get('nasa_note', '-')})")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("🚦 향후 24시간 판단", dom_24_tag, f"최대 {df_24h['Ensemble_Prob'].max():.0f}% · 누적 {df_24h['Ensemble_Rain'].sum():.1f}mm")
@@ -2272,8 +2498,18 @@ with tab_ai:
 
 with tab_status:
     st.markdown("#### 🖥️ 스냅샷 아카이브 · 최적 임계값 보정 & 시스템 상태")
-    if st.button("🔄 기상청 추가 AWS 관측소 목록 동기화 (KMA 6.3 → 로컬캐시 저장)", key="sync_aws_btn"):
-        with st.spinner("기상청 제주 AWS 목록 동기화 중..."):
-            cnt = auto_discover_jeju_aws_stations(KMA_AUTH_KEY, allow_network=True, force=True)
-        st.success(f"✅ 확장 AWS {cnt}개소 동기화 완료 (총 {len(JEJU_STATIONS)}개소 등록)")
+    c_s1, c_s2 = st.columns(2)
+    with c_s1:
+        if st.button("🔄 기상청 추가 AWS 목록 동기화 (KMA 6.3 → 로컬캐시)", key="sync_aws_btn", use_container_width=True):
+            with st.spinner("기상청 제주 AWS 목록 동기화 중..."):
+                cnt = auto_discover_jeju_aws_stations(KMA_AUTH_KEY, allow_network=True, force=True)
+            st.success(f"✅ 확장 AWS {cnt}개소 동기화 완료 (총 {len(JEJU_STATIONS)}개소 등록)")
+    with c_s2:
+        if st.button("🛰️ NASA 제주격자 캐시 수동 갱신 (tavg1_2d_flx_Nx.latest)", key="sync_nasa_btn", use_container_width=True):
+            with st.spinner("NASA 단일 경량 데이터(13스텝×5×3격자) 수집 중... (최대 30초)"):
+                ok_n, sec_n, msg_n = prefetch_nasa_jeju_grid_cache(read_timeout=30)
+            if ok_n:
+                st.success(f"✅ {msg_n}")
+            else:
+                st.warning(f"⚠️ {msg_n}")
     st.code(format_status_report())
