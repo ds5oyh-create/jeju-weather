@@ -1,10 +1,10 @@
 {
   "recommended_level": 3,
-  "consecutive_full_fails": 0,
+  "consecutive_full_fails": 1,
   "consecutive_fast_ok": 0,
-  "last_run_at": "2026-11-23 16:34",
-  "last_status": "✅ 성공(L3)",
-  "last_action": "L1 실패 → L3 자동 강등 복구 성공 (익일 L3 우선 적용)",
+  "last_run_at": "2026-11-23 17:36",
+  "last_status": "❌ 전단계실패(ReadTimeout)",
+  "last_action": "L1~L3 모두 실패 → 익일 L3 최소복구(5파일·1점)부터 바로 시도",
   "events": [
     {
       "time": "2026-11-23 16:34",
@@ -38,6 +38,17 @@
       "result": "SUCCESS",
       "detail": "1/1격자 수신 (tlml,prectot)",
       "action": "L1 실패 → L3 자동 강등 복구 성공 (익일 L3 우선 적용)"
+    },
+    {
+      "time": "2026-11-23 17:36",
+      "level": 3,
+      "run": "flx_Nx.20261122_12Z",
+      "files": 5,
+      "das_ms": 575,
+      "data_ms": 60061,
+      "result": "ReadTimeout",
+      "detail": "flx_Nx.20261122_12Z L3 ReadTimeout(60s · 5파일)",
+      "action": "L3 최소복구도 시간초과"
     }
   ]
 }
