@@ -1,0 +1,43 @@
+{
+  "recommended_level": 3,
+  "consecutive_full_fails": 0,
+  "consecutive_fast_ok": 0,
+  "last_run_at": "2026-11-23 16:34",
+  "last_status": "✅ 성공(L3)",
+  "last_action": "L1 실패 → L3 자동 강등 복구 성공 (익일 L3 우선 적용)",
+  "events": [
+    {
+      "time": "2026-11-23 16:34",
+      "level": 1,
+      "run": "flx_Nx.20261122_12Z",
+      "files": 13,
+      "das_ms": 931,
+      "data_ms": 40016,
+      "result": "ReadTimeout",
+      "detail": "flx_Nx.20261122_12Z L1 ReadTimeout(40s · 13파일)",
+      "action": "자동 강등 → L2 재시도"
+    },
+    {
+      "time": "2026-11-23 16:34",
+      "level": 2,
+      "run": "flx_Nx.20261122_12Z",
+      "files": 7,
+      "das_ms": 931,
+      "data_ms": 50214,
+      "result": "ReadTimeout",
+      "detail": "flx_Nx.20261122_12Z L2 ReadTimeout(50s · 7파일)",
+      "action": "자동 강등 → L3 재시도"
+    },
+    {
+      "time": "2026-11-23 16:34",
+      "level": 3,
+      "run": "flx_Nx.20261122_12Z",
+      "files": 5,
+      "das_ms": 931,
+      "data_ms": 18499,
+      "result": "SUCCESS",
+      "detail": "1/1격자 수신 (tlml,prectot)",
+      "action": "L1 실패 → L3 자동 강등 복구 성공 (익일 L3 우선 적용)"
+    }
+  ]
+}
