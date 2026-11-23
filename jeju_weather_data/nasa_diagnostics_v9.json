@@ -1,9 +1,9 @@
 {
   "recommended_level": 3,
-  "consecutive_full_fails": 1,
+  "consecutive_full_fails": 2,
   "consecutive_fast_ok": 0,
-  "last_run_at": "2026-11-23 17:36",
-  "last_status": "❌ 전단계실패(ReadTimeout)",
+  "last_run_at": "2026-11-24 02:02",
+  "last_status": "❌ 전단계실패(HTTP_504)",
   "last_action": "L1~L3 모두 실패 → 익일 L3 최소복구(5파일·1점)부터 바로 시도",
   "events": [
     {
@@ -49,6 +49,17 @@
       "result": "ReadTimeout",
       "detail": "flx_Nx.20261122_12Z L3 ReadTimeout(60s · 5파일)",
       "action": "L3 최소복구도 시간초과"
+    },
+    {
+      "time": "2026-11-24 02:02",
+      "level": 3,
+      "run": "flx_Nx.20261123_00Z",
+      "files": 5,
+      "das_ms": 156,
+      "data_ms": 60012,
+      "result": "HTTP_504",
+      "detail": "flx_Nx.20261123_00Z L3 HTTP 504",
+      "action": "전 단계 실패"
     }
   ]
 }
