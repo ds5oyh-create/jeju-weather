@@ -1,10 +1,10 @@
 {
   "recommended_level": 3,
-  "consecutive_full_fails": 3,
+  "consecutive_full_fails": 0,
   "consecutive_fast_ok": 0,
-  "last_run_at": "2026-11-25 02:05",
-  "last_status": "❌ 전단계실패(HTTP_504)",
-  "last_action": "연속 3회 전단계 실패 — NASA 서버 구조적 지연(10대 전용 운영 권장)",
+  "last_run_at": "2026-11-25 22:15",
+  "last_status": "✅ 성공(L3)",
+  "last_action": "L3 정상 수집 (51.5s)",
   "events": [
     {
       "time": "2026-11-23 16:34",
@@ -71,6 +71,17 @@
       "result": "HTTP_504",
       "detail": "flx_Nx.20261124_00Z L3 HTTP 504",
       "action": "전 단계 실패"
+    },
+    {
+      "time": "2026-11-25 22:15",
+      "level": 3,
+      "run": "flx_Nx.latest",
+      "files": 5,
+      "das_ms": 347,
+      "data_ms": 51541,
+      "result": "SUCCESS",
+      "detail": "1/1격자 수신 (tlml,prectot)",
+      "action": "L3 정상 수집 (51.5s)"
     }
   ]
 }
