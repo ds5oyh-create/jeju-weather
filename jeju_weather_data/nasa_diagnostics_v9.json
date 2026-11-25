@@ -2,9 +2,9 @@
   "recommended_level": 3,
   "consecutive_full_fails": 0,
   "consecutive_fast_ok": 0,
-  "last_run_at": "2026-11-25 22:56",
+  "last_run_at": "2026-11-26 02:04",
   "last_status": "✅ 성공(L3)",
-  "last_action": "L3 정상 수집 (26.9s)",
+  "last_action": "L3 정상 수집 (31.1s)",
   "events": [
     {
       "time": "2026-11-23 16:34",
@@ -93,6 +93,17 @@
       "result": "SUCCESS",
       "detail": "1/1격자 수신 (tlml,prectot)",
       "action": "L3 정상 수집 (26.9s)"
+    },
+    {
+      "time": "2026-11-26 02:04",
+      "level": 3,
+      "run": "flx_Nx.20261125_00Z",
+      "files": 5,
+      "das_ms": 157,
+      "data_ms": 31111,
+      "result": "SUCCESS",
+      "detail": "1/1격자 수신 (tlml,prectot)",
+      "action": "L3 정상 수집 (31.1s)"
     }
   ]
 }
