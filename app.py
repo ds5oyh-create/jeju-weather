@@ -17,7 +17,7 @@ import numpy as np
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# [0. 시크릿 로더 및 v9.2 기본 설정]
+# [0. 시크릿 로더 및 v9.4 기본 설정]
 # ==========================================
 def get_secret_key(key_name, default_val=""):
     val = os.environ.get(key_name, "")
@@ -46,6 +46,8 @@ MIN_EVAL_HOURS = 12
 DAILY_SCORE_FLOOR, DAILY_SCORE_CAP = 2.0, 25.0
 FINAL_WEIGHT_FLOOR, FINAL_WEIGHT_CAP = 2.0, 30.0
 WEIGHT_RULE_VERSION = "V8_SNAPSHOT_FAIR_90_5"
+AWS_CACHE_SCHEMA = "kma63_authoritative_v2"
+BATCH_SCHEDULE_LABEL = "매일 KST 06:42"
 
 ACTION_STAGE_ORDER = {
     "☀️ 진행(맑음)": 0,
@@ -76,7 +78,6 @@ CAL_MIN_GLOBAL_WET = 24
 CAL_KEEP_DAYS = 30
 SNAPSHOT_KEEP_DAYS = 10
 
-# NASA 3단계 적응형 경량화 프로파일 (ReadTimeout 시 L1 -> L2 -> L3 자동 강등 복구)
 NASA_JEJU_LAT_MIN, NASA_JEJU_LAT_MAX = 492, 496
 NASA_JEJU_LON_MIN, NASA_JEJU_LON_MAX = 980, 982
 NASA_DISK_CACHE_MAX_AGE_H = 24.0
@@ -125,7 +126,8 @@ _KMA_DOWN_REASON = ""
 _OM_SESSION = requests.Session()
 _OM_CACHE = {}
 _NASA_MEM_CACHE = {}
-_OBS_CACHE = {}
+_OBS_DIRECT_CACHE = {}
+_OBS_FALLBACK_CACHE = {}
 _AWS_CACHE_LOADED = False
 _DISCOVERED_NET = False
 
@@ -134,7 +136,8 @@ def reset_runtime_caches():
     _OM_CACHE.clear()
     _NASA_MEM_CACHE.clear()
     with _LOCK:
-        _OBS_CACHE.clear()
+        _OBS_DIRECT_CACHE.clear()
+        _OBS_FALLBACK_CACHE.clear()
         _KMA_DOWN_UNTIL = 0.0
         _KMA_CONN_FAILS = 0
         _KMA_DOWN_REASON = ""
@@ -182,17 +185,38 @@ def _record_kma_conn_failure(reason):
             return True
     return False
 
+def _http_get_text(session, url, params=None, auth=None, connect_to=5, read_to=12, hard_to=22):
+    """스트리밍 청크별 총 경과시간 감시(행 방지) + UTF-8/CP949 안전 디코딩"""
+    t0 = time.monotonic()
+    with session.get(url, params=params, auth=auth, timeout=(connect_to, read_to), stream=True) as resp:
+        chunks = []
+        for chunk in resp.iter_content(chunk_size=16384):
+            if chunk:
+                chunks.append(chunk)
+            if (time.monotonic() - t0) > hard_to:
+                raise requests.exceptions.ReadTimeout(f"HardDeadline({hard_to}s)")
+        raw_bytes = b"".join(chunks)
+        enc = (resp.encoding or "").lower()
+        if enc and enc not in ("iso-8859-1", "latin-1"):
+            text = raw_bytes.decode(enc, errors="replace")
+        else:
+            try:
+                text = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw_bytes.decode("cp949", errors="replace")
+        return resp.status_code, text
+
 SYSTEM_HEALTH = {
-    "storage_mode": "✅ v9.2 NASA 오류수집·3단계자동복구(배치전용) · 웹0ms캐시 · 전 관측소 스냅샷",
+    "storage_mode": f"✅ v9.4 웹Read-Only(KMA 0ms) · 공식지점단일화 · {BATCH_SCHEDULE_LABEL} 배치고정",
     "storage_path": SAVE_DIR,
     "total_error_count": 0,
     "last_check_time": "-",
     "api_status": {
         "Open-Meteo (10대 통합 NWP)": {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
         "NASA GEOS-FP (배치전용캐시)": {"status": "⏸️ 선택대기", "code": "-", "latency_ms": 0, "errors": 0, "msg": "웹 실시간 호출 차단 (토글 시 배치캐시 0ms 로드)"},
-        "KMA 1.1 (AWS 매분자료)":     {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"},
-        "KMA 6.3 (AWS 지점일람표)":   {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "로컬캐시 우선(0ms)"},
-        "KMA ASOS (종관기상관측)":    {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "-"}
+        "KMA 1.1 (AWS 매분자료)":     {"status": "⏸️ 배치전용", "code": "READONLY", "latency_ms": 0, "errors": 0, "msg": f"웹 실시간 호출 생략 ({BATCH_SCHEDULE_LABEL} 배치 갱신)"},
+        "KMA 6.3 (AWS 지점일람표)":   {"status": "대기중", "code": "-", "latency_ms": 0, "errors": 0, "msg": "공식지점 로컬캐시 우선(0ms)"},
+        "KMA ASOS (종관기상관측)":    {"status": "⏸️ 배치전용", "code": "READONLY", "latency_ms": 0, "errors": 0, "msg": f"웹 실시간 호출 생략 ({BATCH_SCHEDULE_LABEL} 배치 갱신)"}
     },
     "model_registry": {}
 }
@@ -204,25 +228,14 @@ ASOS_HUBS = {
     189: {"name": "서귀포", "lat": 33.2461, "lon": 126.5653}
 }
 
-JEJU_STATIONS = {
-    "제주":     {"stn": 184, "lat": 33.5141, "lon": 126.5297, "type": "ASOS", "ht": "20",   "desc": "제주시 북부 도심"},
-    "함덕":     {"stn": 780, "lat": 33.5432, "lon": 126.6695, "type": "AWS",  "ht": "14",   "desc": "조천읍 함덕해수욕장 일대"},
-    "서귀포":   {"stn": 189, "lat": 33.2461, "lon": 126.5653, "type": "ASOS", "ht": "51",   "desc": "서귀포시 남부 도심"},
-    "성산":     {"stn": 188, "lat": 33.3868, "lon": 126.8802, "type": "ASOS", "ht": "20",   "desc": "성산일출봉 및 동부 해안"},
-    "고산":     {"stn": 185, "lat": 33.2938, "lon": 126.1628, "type": "ASOS", "ht": "71",   "desc": "한경면 고산리 및 서부 해안"},
-    "애월":     {"stn": 893, "lat": 33.4628, "lon": 126.3292, "type": "AWS",  "ht": "22",   "desc": "애월읍 북서부 해안"},
-    "구좌":     {"stn": 781, "lat": 33.5204, "lon": 126.8530, "type": "AWS",  "ht": "35",   "desc": "구좌읍 세화/월정 북동부"},
-    "한림":     {"stn": 779, "lat": 33.4097, "lon": 126.2655, "type": "AWS",  "ht": "27",   "desc": "한림읍 협재/금능 일대"},
-    "대정":     {"stn": 793, "lat": 33.2269, "lon": 126.2519, "type": "AWS",  "ht": "30",   "desc": "대정읍 모슬포 남서부"},
-    "중문":     {"stn": 329, "lat": 33.2494, "lon": 126.4144, "type": "AWS",  "ht": "65",   "desc": "서귀포 중문관광단지"},
-    "남원":     {"stn": 783, "lat": 33.2797, "lon": 126.7197, "type": "AWS",  "ht": "32",   "desc": "남원읍 남동부 해안"},
-    "표선":     {"stn": 782, "lat": 33.3268, "lon": 126.8312, "type": "AWS",  "ht": "40",   "desc": "표선면 일대"},
-    "성판악":   {"stn": 866, "lat": 33.3855, "lon": 126.6197, "type": "AWS",  "ht": "750",  "desc": "한라산 동부 중산간(750m)"},
-    "윗세오름": {"stn": 871, "lat": 33.3622, "lon": 126.5186, "type": "AWS",  "ht": "1678", "desc": "한라산 고지대 산간(1700m)"},
-    "우도":     {"stn": 885, "lat": 33.5064, "lon": 126.9531, "type": "AWS",  "ht": "18",   "desc": "우도면 도서 지역"},
-    "추자도":   {"stn": 884, "lat": 33.9619, "lon": 126.2947, "type": "AWS",  "ht": "42",   "desc": "추자면 북방 도서"}
+BASE_ASOS_STATIONS = {
+    "제주":   {"stn": 184, "lat": 33.5141, "lon": 126.5297, "type": "ASOS", "ht": "20", "desc": "제주시 북부 도심 (ASOS)"},
+    "서귀포": {"stn": 189, "lat": 33.2461, "lon": 126.5653, "type": "ASOS", "ht": "51", "desc": "서귀포시 남부 도심 (ASOS)"},
+    "성산":   {"stn": 188, "lat": 33.3868, "lon": 126.8802, "type": "ASOS", "ht": "20", "desc": "성산일출봉·동부 해안 (ASOS)"},
+    "고산":   {"stn": 185, "lat": 33.2938, "lon": 126.1628, "type": "ASOS", "ht": "71", "desc": "한경면 고산·서부 해안 (ASOS)"}
 }
-CORE_STATION_NAMES = list(JEJU_STATIONS.keys())
+ASOS_HUB_NAMES = list(BASE_ASOS_STATIONS.keys())
+JEJU_STATIONS = dict(BASE_ASOS_STATIONS)
 
 MODELS = {
     "ecmwf_ifs025":         {"name": "유럽(ECMWF IFS)",  "org": "ECMWF(유럽)",    "res": "25km"},
@@ -237,6 +250,14 @@ MODELS = {
     "meteofrance_seamless": {"name": "프랑스(ARPEGE)",   "org": "Météo-France",   "res": "25km"},
     "gem_seamless":         {"name": "캐나다(CMC GEM)",  "org": "CMC(캐나다)",    "res": "15km"}
 }
+
+def _is_jeju_coords(lat, lon):
+    """제주 본도·우도·가파도·마라도 및 추자군도만 포함 (전남 완도군 여서도 등 타 도서 제외)"""
+    if 33.10 <= lat <= 33.60 and 126.10 <= lon <= 127.05:
+        return True
+    if 33.85 <= lat <= 34.05 and 126.15 <= lon <= 126.45:
+        return True
+    return False
 
 def estimate_prob_from_rain(rain_series):
     conds = [rain_series.isna(), rain_series <= 0.0, rain_series <= 0.2, rain_series <= 1.0, rain_series <= 3.0]
@@ -258,8 +279,19 @@ def _load_json_safe(path, default_obj):
             pass
     return default_obj
 
+def _empty_metrics_dict():
+    return {
+        k: {
+            'scored': False, 'eval_hours': 0, 'has_wind': False,
+            'temp_mae': 0.0, 'temp_bias': 0.0, 'rain_mae': 0.0,
+            'prob_brier': 0.0, 'wind_mae': 0.0, 'wind_bias': 0.0,
+            'score_temp': 0.0, 'score_prob': 0.0, 'score_rain': 0.0, 'score_wind': 0.0
+        }
+        for k in MODELS.keys()
+    }
+
 # ==========================================
-# [0-B. 최적 임계값 자동 보정 엔진]
+# [0-B. 최적 임계값 자동 보정 엔진 (배치 전용 갱신 · 웹 고정 읽기)]
 # ==========================================
 def _calc_binary_skill(preds, actuals, beta=1.2):
     preds = np.asarray(preds, dtype=bool)
@@ -442,7 +474,7 @@ def get_dominant_action_tag(tag_series):
     return max(valid, key=lambda t: ACTION_STAGE_ORDER[t])
 
 # ==========================================
-# [1. 예보 스냅샷 아카이브 (전체 관측소 · 10일 보관 · NASA 병합)]
+# [1. 예보 스냅샷 아카이브 (배치 전용 저장 · 10일 보관 · NASA 병합)]
 # ==========================================
 def _to_json_list(series):
     return [None if pd.isna(v) else round(float(v), 2) for v in series]
@@ -612,10 +644,10 @@ def prefetch_open_meteo_batch(station_names, om_keys, past_days, now_kst, chunk_
         for attempt in range(3):
             t_req = time.time()
             try:
-                resp = _OM_SESSION.get(url_om, params=params, timeout=(5, 20))
+                status_c, text_b = _http_get_text(_OM_SESSION, url_om, params=params, connect_to=5, read_to=15, hard_to=25)
                 req_ms = int((time.time() - t_req) * 1000)
-                if resp.status_code == 200:
-                    data = resp.json()
+                if status_c == 200:
+                    data = json.loads(text_b)
                     items = data if isinstance(data, list) else ([data] if len(chunk) == 1 else [])
                     if len(items) == len(chunk):
                         now_ts = time.time()
@@ -635,8 +667,8 @@ def prefetch_open_meteo_batch(station_names, om_keys, past_days, now_kst, chunk_
                         break
                     last_err = f"응답개수불일치({len(items)}/{len(chunk)})"
                 else:
-                    last_err = f"HTTP {resp.status_code}"
-                    if resp.status_code in (429, 500, 502, 503, 504):
+                    last_err = f"HTTP {status_c}"
+                    if status_c in (429, 500, 502, 503, 504):
                         time.sleep(2.0 * (attempt + 1))
                         continue
                     break
@@ -669,13 +701,13 @@ def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst):
             params["models"] = ",".join(model_list)
         for attempt in range(3):
             try:
-                resp = _OM_SESSION.get(url_om, params=params, timeout=(4, 12))
-                last_code = str(resp.status_code)
-                data = resp.json()
-                if resp.status_code == 200 and isinstance(data, dict) and "hourly" in data:
+                status_c, text_b = _http_get_text(_OM_SESSION, url_om, params=params, connect_to=4, read_to=12, hard_to=18)
+                last_code = str(status_c)
+                data = json.loads(text_b)
+                if status_c == 200 and isinstance(data, dict) and "hourly" in data:
                     return data
-                last_reason = str(data.get("reason", f"HTTP {resp.status_code}"))[:80] if isinstance(data, dict) else f"HTTP {resp.status_code}"
-                if resp.status_code in (429, 500, 502, 503, 504):
+                last_reason = str(data.get("reason", f"HTTP {status_c}"))[:80] if isinstance(data, dict) else f"HTTP {status_c}"
+                if status_c in (429, 500, 502, 503, 504):
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 break
@@ -743,14 +775,6 @@ def _save_nasa_diag(diag):
     with open(NASA_DIAG_FILE, "w", encoding="utf-8") as f:
         json.dump(diag, f, ensure_ascii=False, indent=2)
 
-def reset_nasa_adaptive_level():
-    diag = _load_nasa_diag()
-    diag["recommended_level"] = 1
-    diag["consecutive_full_fails"] = 0
-    diag["consecutive_fast_ok"] = 0
-    diag["last_action"] = "사용자 수동 L1 초기화 (다음 배치부터 L1 재시도)"
-    _save_nasa_diag(diag)
-
 def _parse_gds_time_str(t_str):
     m = re.match(r'^(\d{1,2})(?::(\d{2}))?z(\d{1,2})([a-zA-Z]{3})(\d{4})$', t_str.strip(), re.IGNORECASE)
     if not m:
@@ -778,7 +802,6 @@ def _parse_das_time_bounds(das_text):
     return t_min, t_max, n_hours
 
 def _parse_opendap_ascii_3d(ascii_text, var_name):
-    """OPeNDAP ASCII 1D/2D/3D Grid 응답을 {(ti, yi, xi): float} 딕셔너리로 안전 파싱"""
     data = {}
     capture = False
     prefixes = (f"{var_name}.{var_name}", f"{var_name},", f"{var_name}[")
@@ -812,11 +835,11 @@ def _parse_opendap_ascii_3d(ascii_text, var_name):
             break
     return data
 
-def _nasa_get(session, url, timeout=(6, 20)):
-    resp = session.get(url, timeout=timeout)
-    if resp.status_code == 401 and NASA_USER and NASA_PASS:
-        resp = session.get(url, auth=(NASA_USER, NASA_PASS), timeout=timeout)
-    return resp
+def _nasa_get_text(session, url, connect_to=6, read_to=20, hard_to=25):
+    sc, txt = _http_get_text(session, url, connect_to=connect_to, read_to=read_to, hard_to=hard_to)
+    if sc == 401 and NASA_USER and NASA_PASS:
+        sc, txt = _http_get_text(session, url, auth=(NASA_USER, NASA_PASS), connect_to=connect_to, read_to=read_to, hard_to=hard_to)
+    return sc, txt
 
 def _nasa_grid_cell_for_coords(lat, lon):
     lat_idx = int(np.clip(round((lat + 90.0) / 0.25), NASA_JEJU_LAT_MIN, NASA_JEJU_LAT_MAX))
@@ -862,10 +885,6 @@ def _build_nasa_df_from_cell(times_iso, cell_dict, step_hours=6):
     return df_fc, has_rain
 
 def load_nasa_from_disk_cache(lat, lon, max_age_hours=NASA_DISK_CACHE_MAX_AGE_H):
-    """
-    jeju_weather_data/nasa_latest_cache.json에서 0ms로 NASA 격자 예보 로드.
-    L2(3x2) 또는 L3(1x1) 축소 캐시일 경우 최단거리 캐시 격자로 자동 매핑.
-    """
     cache = _load_json_safe(NASA_LATEST_CACHE_FILE, {})
     if not isinstance(cache, dict) or not cache.get("cells") or not cache.get("times"):
         return pd.DataFrame(), "배치캐시 미생성", False, False
@@ -911,10 +930,8 @@ def load_nasa_from_disk_cache(lat, lon, max_age_hours=NASA_DISK_CACHE_MAX_AGE_H)
     return df_fc, note, has_rain, is_fresh
 
 def _build_nasa_candidate_runs(now_utc):
-    """발표 후 5시간 이상 경과해 서버에 존재할 가능성이 높은 장기 런(00Z/12Z) 위주로 후보 생성"""
     base_fcast = "https://opendap.nccs.nasa.gov/dods/GEOS-5/fp/0.25_deg/fcast"
     cands = [("flx_Nx.latest", f"{base_fcast}/tavg1_2d_flx_Nx.latest")]
-    # 최근 48시간 내 00Z/12Z 중 최소 5시간 이상 경과한 런만 역순 추가
     for h_back in range(5, 42):
         dt_c = (now_utc - timedelta(hours=h_back)).replace(minute=0, second=0, microsecond=0)
         if dt_c.hour in (0, 12):
@@ -928,12 +945,6 @@ def _build_nasa_candidate_runs(now_utc):
     return cands
 
 def prefetch_nasa_jeju_grid_cache_adaptive():
-    """
-    [배치 전용 NASA 오류수집 + 3단계 자동복구 엔진]
-    1) 경량 .das 메타데이터로 가용 최신 런 및 시간 범위 확인
-    2) 직전 학습된 권장 단계(recommended_level)부터 L1 -> L2 -> L3 순차 자동 강등 시도
-    3) 모든 시도/오류/자동조치를 nasa_diagnostics_v9.json에 기록하고 성공 시 nasa_latest_cache.json 저장
-    """
     t_all0 = time.time()
     diag = _load_nasa_diag()
     start_level = diag.get("recommended_level", 1)
@@ -942,7 +953,6 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
     session = requests.Session()
     candidates = _build_nasa_candidate_runs(now_utc)
 
-    # 1단계: .das 메타데이터 확인 (약 2KB)
     selected = None
     short_fallback = None
     das_err = "유효런없음"
@@ -952,13 +962,13 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
     for label, ds_url in candidates:
         t_d0 = time.time()
         try:
-            r_das = _nasa_get(session, f"{ds_url}.das", timeout=(6, 12))
+            sc_d, txt_d = _nasa_get_text(session, f"{ds_url}.das", connect_to=6, read_to=12, hard_to=15)
             das_ms_total += int((time.time() - t_d0) * 1000)
-            if r_das.status_code != 200:
-                das_err = f"{label} DAS HTTP {r_das.status_code}"
-                das_err_type = f"HTTP_{r_das.status_code}"
+            if sc_d != 200:
+                das_err = f"{label} DAS HTTP {sc_d}"
+                das_err_type = f"HTTP_{sc_d}"
                 continue
-            t_min, t_max, n_hours = _parse_das_time_bounds(r_das.text)
+            t_min, t_max, n_hours = _parse_das_time_bounds(txt_d)
             if not t_min or n_hours < 18:
                 das_err = f"{label} DAS 시간파싱실패"
                 das_err_type = "DAS_PARSE"
@@ -975,7 +985,7 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
             break
         except requests.exceptions.ReadTimeout:
             das_ms_total += int((time.time() - t_d0) * 1000)
-            das_err = f"{label} DAS ReadTimeout(12s)"
+            das_err = f"{label} DAS ReadTimeout(15s)"
             das_err_type = "ReadTimeout"
             continue
         except Exception as e:
@@ -1008,8 +1018,6 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
 
     label, ds_url, t_min_utc, n_hours = selected
     hours_elapsed = int((now_utc - t_min_utc).total_seconds() // 3600)
-
-    # 2단계: start_level -> 3 순차 자동 경량화 시도
     last_err = "알수없음"
     last_err_type = "UNKNOWN"
 
@@ -1022,7 +1030,8 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
         lon_s, lon_e = prof["lon_range"]
         r_timeout = prof["timeout"]
 
-        t_start = max(0, min(hours_elapsed - step, max(0, n_hours - 24)))
+        # 과거 낭비를 최대 3시간으로 제한해 L3에서도 약 45시간의 미래 예보를 확보
+        t_start = max(0, min(hours_elapsed - min(3, step), max(0, n_hours - 24)))
         t_end = min(n_hours - 1, t_start + horizon)
         t_indices = list(range(t_start, t_end + 1, step))
         if len(t_indices) < 3:
@@ -1035,24 +1044,26 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
 
         t_req0 = time.time()
         try:
-            r_data = _nasa_get(session, ascii_url, timeout=(10, r_timeout))
+            sc_data, txt_data = _nasa_get_text(
+                session, ascii_url, connect_to=10, read_to=r_timeout, hard_to=r_timeout + 5
+            )
             data_ms = int((time.time() - t_req0) * 1000)
 
-            if r_data.status_code != 200:
-                last_err_type = f"HTTP_{r_data.status_code}"
-                last_err = f"{label} L{lvl} HTTP {r_data.status_code}"
+            if sc_data != 200:
+                last_err_type = f"HTTP_{sc_data}"
+                last_err = f"{label} L{lvl} HTTP {sc_data}"
                 act = f"L{lvl+1} 경량화 재시도" if lvl < 3 else "전 단계 실패"
                 diag["events"].append({
                     "time": now_kst_str, "level": lvl, "run": label, "files": len(t_indices),
                     "das_ms": das_ms_total, "data_ms": data_ms, "result": last_err_type,
                     "detail": last_err, "action": act
                 })
-                if r_data.status_code in (401, 403, 404):
+                if sc_data in (401, 403, 404):
                     break
                 continue
 
-            if "Error" in r_data.text[:300] or "tlml" not in r_data.text:
-                snippet = r_data.text.strip().splitlines()[0][:80] if r_data.text.strip() else "빈응답"
+            if "Error" in txt_data[:300] or "tlml" not in txt_data:
+                snippet = txt_data.strip().splitlines()[0][:80] if txt_data.strip() else "빈응답"
                 last_err_type = "OPeNDAP_Error"
                 last_err = f"{label} L{lvl} {snippet}"
                 act = f"L{lvl+1} 경량화 재시도" if lvl < 3 else "전 단계 실패"
@@ -1063,9 +1074,9 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
                 })
                 continue
 
-            tlml_map = _parse_opendap_ascii_3d(r_data.text, "tlml")
-            spd_map = _parse_opendap_ascii_3d(r_data.text, "speed") if "speed" in req_vars else {}
-            prc_map = _parse_opendap_ascii_3d(r_data.text, "prectot") if "prectot" in req_vars else {}
+            tlml_map = _parse_opendap_ascii_3d(txt_data, "tlml")
+            spd_map = _parse_opendap_ascii_3d(txt_data, "speed") if "speed" in req_vars else {}
+            prc_map = _parse_opendap_ascii_3d(txt_data, "prectot") if "prectot" in req_vars else {}
 
             st_kst_base = (t_min_utc + timedelta(hours=9)).replace(tzinfo=None, minute=0, second=0, microsecond=0)
             times_iso = [(st_kst_base + timedelta(hours=ti_abs)).strftime("%Y-%m-%d %H:%M") for ti_abs in t_indices]
@@ -1111,7 +1122,6 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
                     json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
                 _NASA_MEM_CACHE.clear()
 
-                # 적응형 단계 학습: 강등 후 성공하면 해당 단계를 다음 시작점으로 고정, 빠른 성공 3회 누적 시 승격
                 diag["consecutive_full_fails"] = 0
                 if lvl > start_level:
                     diag["recommended_level"] = lvl
@@ -1204,10 +1214,6 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
     return False, sec, f"미수신({last_err})"
 
 def fetch_nasa_geos_cache_only(lat, lon):
-    """
-    [웹·배치 루프 공통] 외부 NASA 서버를 직접 호출하지 않고
-    배치가 선행 수집한 nasa_latest_cache.json만 0ms로 읽음.
-    """
     lat_idx, lon_idx = _nasa_grid_cell_for_coords(lat, lon)
     ck = (lat_idx, lon_idx)
     now_ts = time.time()
@@ -1242,39 +1248,58 @@ def fetch_nasa_geos_cache_only(lat, lon):
     return pd.DataFrame(), 0.0, f"배치캐시 미생성 — Actions 수집 대기 ({diag_hint})", False
 
 # ==========================================
-# [4. 기상청 AWS 로컬캐시(주 1회 갱신) + ASOS 일괄조회 + 회로차단기]
+# [4. 기상청 공식 AWS 단일화(KMA 6.3) + ASOS 일괄조회 + HardDeadline]
 # ==========================================
 def _is_conn_error(exc):
     return isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError))
 
 def _format_req_error(exc, read_sec):
     if isinstance(exc, requests.exceptions.ReadTimeout):
-        return f"ReadTimeout({read_sec}s초과)"
+        msg = str(exc)
+        return msg if "HardDeadline" in msg else f"ReadTimeout({read_sec}s초과)"
     if isinstance(exc, requests.exceptions.ConnectTimeout):
         return "ConnectTimeout(5s초과)"
     if isinstance(exc, requests.exceptions.ConnectionError):
         return "ConnectionError"
     return f"{type(exc).__name__}:{str(exc)[:25]}"
 
+def _rebuild_station_registry(aws_map):
+    JEJU_STATIONS.clear()
+    JEJU_STATIONS.update(BASE_ASOS_STATIONS)
+    used_ids = set(ASOS_HUBS.keys())
+    for nk in sorted(aws_map.keys()):
+        info = aws_map[nk]
+        if not isinstance(info, dict) or "stn" not in info:
+            continue
+        sn = int(info["stn"])
+        lv, lnv = float(info.get("lat", 0.0)), float(info.get("lon", 0.0))
+        if sn in used_ids or nk in BASE_ASOS_STATIONS or not _is_jeju_coords(lv, lnv):
+            continue
+        used_ids.add(sn)
+        JEJU_STATIONS[nk] = info
+
 def load_cached_jeju_aws_stations():
+    """로컬 AWS 캐시만 0ms 로드 (웹 기동 지연 방지)"""
     global _AWS_CACHE_LOADED
     cache_data = _load_json_safe(AWS_STATIONS_CACHE_FILE, {})
+    is_v2 = isinstance(cache_data, dict) and cache_data.get("schema") == AWS_CACHE_SCHEMA
     extra = cache_data.get("stations", {}) if isinstance(cache_data, dict) else {}
-    for nk, info in extra.items():
-        if nk not in JEJU_STATIONS and isinstance(info, dict) and "stn" in info:
-            JEJU_STATIONS[nk] = info
+    _rebuild_station_registry(extra)
     _AWS_CACHE_LOADED = True
-    if extra:
+    aws_cnt = len(JEJU_STATIONS) - len(BASE_ASOS_STATIONS)
+    if aws_cnt > 0:
         upd = cache_data.get("updated_at", "-")
+        tag = "공식v2캐시" if is_v2 else "구형v1캐시(배치갱신대기)"
         SYSTEM_HEALTH["api_status"]["KMA 6.3 (AWS 지점일람표)"] = {
-            "status": "✅ 캐시로드", "code": "CACHE", "latency_ms": 0,
-            "errors": 0, "msg": f"로컬캐시 {len(extra)}개소 로드 (갱신 {upd})"
+            "status": "✅ 캐시로드" if is_v2 else "⚠️ 갱신대기",
+            "code": "CACHE", "latency_ms": 0, "errors": 0,
+            "msg": f"{tag} AWS {aws_cnt}개소 (갱신 {upd})"
         }
-    return len(extra), cache_data.get("updated_at", "")
+    return aws_cnt, cache_data.get("updated_at", ""), is_v2
 
 def auto_discover_jeju_aws_stations(auth_key, allow_network=False, force=False):
     global _DISCOVERED_NET
-    cached_cnt, updated_at = load_cached_jeju_aws_stations()
+    cached_cnt, updated_at, is_v2 = load_cached_jeju_aws_stations()
     if not allow_network:
         return cached_cnt
     if not auth_key or _is_kma_down():
@@ -1282,7 +1307,7 @@ def auto_discover_jeju_aws_stations(auth_key, allow_network=False, force=False):
     if _DISCOVERED_NET and not force:
         return cached_cnt
 
-    if not force and cached_cnt > 0 and updated_at:
+    if not force and is_v2 and cached_cnt > 0 and updated_at:
         try:
             upd_dt = datetime.strptime(updated_at[:10], "%Y-%m-%d").date()
             if (datetime.now(KST).date() - upd_dt).days < 7:
@@ -1294,36 +1319,59 @@ def auto_discover_jeju_aws_stations(auth_key, allow_network=False, force=False):
     url = "https://apihub.kma.go.kr/api/typ02/openApi/AwsYearlyInfoService/getAwsStnLstTbl"
     t0 = time.time()
     sess = _get_kma_session()
-    for yr in ["2024", "2023", "2022"]:
+    cur_yr = datetime.now(KST).year
+    years = []
+    for y in [cur_yr, cur_yr - 1, 2024, 2023]:
+        ys = str(y)
+        if ys not in years:
+            years.append(ys)
+
+    for yr in years:
         if _is_kma_down():
             return cached_cnt
         try:
-            res = sess.get(url, params={"pageNo": 1, "numOfRows": 700, "dataType": "XML", "year": yr, "month": "09", "authKey": auth_key}, timeout=(3, 5))
+            sc, txt = _http_get_text(
+                sess, url,
+                params={"pageNo": 1, "numOfRows": 700, "dataType": "XML", "year": yr, "month": "09", "authKey": auth_key},
+                connect_to=4, read_to=8, hard_to=12
+            )
             _record_kma_conn_success()
-            if res.status_code == 200 and "<stn_id>" in res.text:
-                root = ET.fromstring(res.text)
+            if sc == 200 and "<stn_id>" in txt:
+                root = ET.fromstring(txt)
                 extra_map = {}
+                used_ids = set(ASOS_HUBS.keys())
                 for it in root.iter():
                     sid, sko, lat_e, lon_e, ht_e = it.find("stn_id"), it.find("stn_ko"), it.find("lat"), it.find("lon"), it.find("ht")
                     if None not in (sid, sko, lat_e, lon_e):
-                        lv, lnv = float(lat_e.text), float(lon_e.text)
-                        nk, sn = sko.text.strip(), int(sid.text.strip())
+                        try:
+                            lv, lnv = float(lat_e.text), float(lon_e.text)
+                            nk, sn = sko.text.strip(), int(sid.text.strip())
+                        except Exception:
+                            continue
                         hv = ht_e.text.strip() if ht_e is not None and ht_e.text else "0"
-                        if 33.10 <= lv <= 34.05 and 126.00 <= lnv <= 127.05 and nk not in CORE_STATION_NAMES and sn not in [184, 185, 188, 189]:
-                            info = {"stn": sn, "lat": lv, "lon": lnv, "type": "AWS", "ht": hv, "desc": f"제주 AWS (해발 {hv}m)"}
-                            extra_map[nk] = info
-                            JEJU_STATIONS[nk] = info
+                        if _is_jeju_coords(lv, lnv) and sn not in used_ids and nk not in BASE_ASOS_STATIONS:
+                            used_ids.add(sn)
+                            extra_map[nk] = {
+                                "stn": sn, "lat": lv, "lon": lnv,
+                                "type": "AWS", "ht": hv, "desc": f"제주 공식 AWS (해발 {hv}m)"
+                            }
                 if extra_map:
+                    _rebuild_station_registry(extra_map)
                     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
                     with open(AWS_STATIONS_CACHE_FILE, "w", encoding="utf-8") as f:
-                        json.dump({"updated_at": now_str, "stations": extra_map}, f, ensure_ascii=False, indent=2)
+                        json.dump({
+                            "schema": AWS_CACHE_SCHEMA,
+                            "source_year": yr,
+                            "updated_at": now_str,
+                            "stations": extra_map
+                        }, f, ensure_ascii=False, indent=2)
                     SYSTEM_HEALTH["api_status"]["KMA 6.3 (AWS 지점일람표)"] = {
-                        "status": "✅ 정상", "code": "200 OK", "latency_ms": int((time.time()-t0)*1000),
-                        "errors": 0, "msg": f"제주 AWS {len(extra_map)}개소 동기화·캐시저장"
+                        "status": "✅ 정상(공식v2)", "code": "200 OK", "latency_ms": int((time.time()-t0)*1000),
+                        "errors": 0, "msg": f"{yr}년 공식 제주 AWS {len(extra_map)}개소 동기화 (충돌·타도서 제거)"
                     }
                     return len(extra_map)
         except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as e:
-            _record_kma_conn_failure(_format_req_error(e, 5))
+            _record_kma_conn_failure(_format_req_error(e, 8))
             return cached_cnt
         except Exception:
             pass
@@ -1334,7 +1382,7 @@ def _interpolate_from_cached_asos(stn_info, date_str, fail_reason):
     avail = []
     with _LOCK:
         for aid, aname, dist in dists:
-            cached = _OBS_CACHE.get((aid, date_str))
+            cached = _OBS_DIRECT_CACHE.get((aid, date_str))
             if cached and not cached[0].empty:
                 avail.append((cached[0].copy(), aname, dist))
             if len(avail) == 2:
@@ -1355,9 +1403,6 @@ def prefetch_kma_asos_batch(date_str, auth_key):
         return 0.0, 0, "기상청 API 키 미설정"
     if _is_kma_down():
         reason = _get_kma_down_reason()
-        with _LOCK:
-            for sid in ASOS_HUBS.keys():
-                _OBS_CACHE[(sid, date_str)] = (pd.DataFrame(), f"기상청 회로차단({reason})")
         return 0.0, 0, f"회로차단({reason})"
 
     t0 = time.time()
@@ -1372,16 +1417,16 @@ def prefetch_kma_asos_batch(date_str, auth_key):
             last_reason = f"회로차단({_get_kma_down_reason()})"
             break
         try:
-            res = sess.get(url, timeout=(5, 12))
+            sc, txt = _http_get_text(sess, url, connect_to=5, read_to=12, hard_to=18)
             _record_kma_conn_success()
             sec = time.time() - t0
-            if res.status_code != 200:
-                last_reason = f"HTTP {res.status_code}"
-            elif "auth" in res.text.lower() and len(res.text.strip()) < 200:
+            if sc != 200:
+                last_reason = f"HTTP {sc}"
+            elif "auth" in txt.lower() and len(txt.strip()) < 200:
                 last_reason = "인증오류(auth)"
             else:
                 grouped = {sid: [] for sid in hub_ids}
-                for ln in res.text.split('\n'):
+                for ln in txt.split('\n'):
                     s = ln.strip()
                     if not s or s.startswith('#'): continue
                     p = s.replace(',', ' ').split()
@@ -1400,10 +1445,8 @@ def prefetch_kma_asos_batch(date_str, auth_key):
                 with _LOCK:
                     for sid, recs in grouped.items():
                         if recs:
-                            _OBS_CACHE[(sid, date_str)] = (pd.DataFrame(recs).drop_duplicates('time').set_index('time'), f"지점 {sid} (ASOS 일괄 직접 관측)")
+                            _OBS_DIRECT_CACHE[(sid, date_str)] = (pd.DataFrame(recs).drop_duplicates('time').set_index('time'), f"지점 {sid} (ASOS 일괄 직접 관측)")
                             ok_cnt += 1
-                        else:
-                            _OBS_CACHE[(sid, date_str)] = (pd.DataFrame(), f"지점 {sid} (ASOS 빈데이터)")
                     SYSTEM_HEALTH["api_status"]["KMA ASOS (종관기상관측)"] = {
                         "status": "✅ 정상" if ok_cnt == len(hub_ids) else "⚠️ 부분수신",
                         "code": "200 OK", "latency_ms": int(sec * 1000),
@@ -1422,30 +1465,38 @@ def prefetch_kma_asos_batch(date_str, auth_key):
     sec = time.time() - t0
     fail_msg = f"기상청 회로차단({last_reason})" if _is_kma_down() else f"ASOS 일괄실패({last_reason})"
     with _LOCK:
-        for sid in hub_ids:
-            if (sid, date_str) not in _OBS_CACHE:
-                _OBS_CACHE[(sid, date_str)] = (pd.DataFrame(), fail_msg)
         SYSTEM_HEALTH["api_status"]["KMA ASOS (종관기상관측)"] = {
             "status": "⛔ 회로차단" if _is_kma_down() else "❌ 일괄실패",
             "code": "ERR", "latency_ms": int(sec * 1000), "errors": 1, "msg": fail_msg
         }
     return sec, 0, last_reason
 
-def fetch_kma_obs_v8(stn_info, date_str, auth_key):
+def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None, max_retries=2, read_to=12, hard_to=20):
     if not auth_key:
         return pd.DataFrame(), "기상청 API 키 미설정 (Secrets에 KMA_AUTH_KEY 등록 필요)", 0.0
     stn_id = stn_info["stn"]
-    ck = (stn_id, date_str)
+    direct_ck = (stn_id, date_str)
+    fb_ck = (stn_name or str(stn_id), stn_id, date_str)
+
     with _LOCK:
-        if ck in _OBS_CACHE:
-            df_c, msg_c = _OBS_CACHE[ck]
+        if direct_ck in _OBS_DIRECT_CACHE:
+            df_c, msg_c = _OBS_DIRECT_CACHE[direct_ck]
+            return df_c.copy(), msg_c, 0.0
+        if fb_ck in _OBS_FALLBACK_CACHE:
+            df_c, msg_c = _OBS_FALLBACK_CACHE[fb_ck]
             return df_c.copy(), msg_c, 0.0
 
     if _is_kma_down():
         reason = _get_kma_down_reason()
         dfb, msg_b = _interpolate_from_cached_asos(stn_info, date_str, f"회로차단:{reason}") if stn_info["type"] != "ASOS" else (pd.DataFrame(), f"기상청 회로차단({reason})")
         with _LOCK:
-            _OBS_CACHE[ck] = (dfb, msg_b)
+            _OBS_FALLBACK_CACHE[fb_ck] = (dfb, msg_b)
+        return dfb, msg_b, 0.0
+
+    if deadline_ts is not None and time.monotonic() > deadline_ts:
+        dfb, msg_b = _interpolate_from_cached_asos(stn_info, date_str, "배치상한도달") if stn_info["type"] != "ASOS" else (pd.DataFrame(), "배치상한도달")
+        with _LOCK:
+            _OBS_FALLBACK_CACHE[fb_ck] = (dfb, msg_b)
         return dfb, msg_b, 0.0
 
     t0 = time.time()
@@ -1455,17 +1506,17 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key):
     if stn_info["type"] == "ASOS":
         url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfctm3.php?tm1={tm1}&tm2={tm2}&stn={stn_id}&help=0&authKey={auth_key}"
         last_reason = "알수없음"
-        for attempt in range(2):
+        for attempt in range(max_retries):
             if _is_kma_down():
                 last_reason = f"회로차단({_get_kma_down_reason()})"
                 break
             try:
-                res = sess.get(url, timeout=(5, 12))
+                sc, txt = _http_get_text(sess, url, connect_to=5, read_to=read_to, hard_to=hard_to)
                 _record_kma_conn_success()
                 sec = time.time() - t0
-                if res.status_code == 200:
+                if sc == 200:
                     recs = []
-                    for ln in res.text.split('\n'):
+                    for ln in txt.split('\n'):
                         s = ln.strip()
                         if not s or s.startswith('#'): continue
                         p = s.replace(',', ' ').split()
@@ -1479,46 +1530,49 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key):
                         msg = f"지점 {stn_id} (ASOS 직접 관측)"
                         with _LOCK:
                             SYSTEM_HEALTH["api_status"]["KMA ASOS (종관기상관측)"] = {"status": "✅ 정상", "code": "200 OK", "latency_ms": int(sec * 1000), "errors": 0, "msg": f"지점 {stn_id} {len(dfr)}시간"}
-                            _OBS_CACHE[ck] = (dfr, msg)
+                            _OBS_DIRECT_CACHE[direct_ck] = (dfr, msg)
                         return dfr, msg, sec
                     last_reason = "빈데이터(0건)"
                 else:
-                    last_reason = f"HTTP {res.status_code}"
+                    last_reason = f"HTTP {sc}"
             except Exception as e:
-                last_reason = _format_req_error(e, 12)
+                last_reason = _format_req_error(e, read_to)
                 if _is_conn_error(e) and _record_kma_conn_failure(last_reason):
                     break
-            if attempt == 0:
+            if attempt + 1 < max_retries:
                 time.sleep(0.5)
         sec = time.time() - t0
         fail_msg = f"ASOS 실패({last_reason})"
         with _LOCK:
-            _OBS_CACHE[ck] = (pd.DataFrame(), fail_msg)
+            _OBS_FALLBACK_CACHE[fb_ck] = (pd.DataFrame(), fail_msg)
         return pd.DataFrame(), fail_msg, sec
 
     url_m = f"https://apihub.kma.go.kr/api/typ01/cgi-bin/url/nph-aws2_min?tm1={tm1}&tm2={tm2}&stn={stn_id}&disp=1&help=0&authKey={auth_key}"
     fail_reason = "알수없음"
-    for attempt in range(2):
+    for attempt in range(max_retries):
         if _is_kma_down():
             fail_reason = f"회로차단({_get_kma_down_reason()})"
+            break
+        if deadline_ts is not None and time.monotonic() > deadline_ts:
+            fail_reason = "배치상한도달"
             break
         _kma_rate_wait(0.2)
         if _is_kma_down():
             fail_reason = f"회로차단({_get_kma_down_reason()})"
             break
         try:
-            res = sess.get(url_m, timeout=(5, 15))
+            sc, txt = _http_get_text(sess, url_m, connect_to=5, read_to=read_to, hard_to=hard_to)
             _record_kma_conn_success()
             sec = time.time() - t0
-            if res.status_code != 200:
-                fail_reason = f"HTTP {res.status_code}"
-            elif "auth" in res.text.lower() and len(res.text.strip()) < 200:
+            if sc != 200:
+                fail_reason = f"HTTP {sc}"
+            elif "auth" in txt.lower() and len(txt.strip()) < 200:
                 fail_reason = "인증오류(auth)"
-            elif len(res.text.strip()) <= 40:
-                fail_reason = f"빈응답({len(res.text.strip())}B)"
+            elif len(txt.strip()) <= 40:
+                fail_reason = f"빈응답({len(txt.strip())}B)"
             else:
                 recs = []
-                for ln in res.text.split('\n'):
+                for ln in txt.split('\n'):
                     s = ln.strip()
                     if not s or s.startswith('#'): continue
                     p = [x.strip() for x in s.replace(',', ' ').split() if x.strip()]
@@ -1540,32 +1594,33 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key):
                             "status": "✅ 정상", "code": "200 OK", "latency_ms": int(sec * 1000),
                             "errors": 0, "msg": f"지점 {stn_id} {len(dfr)}시간 직결{retry_tag}"
                         }
-                        _OBS_CACHE[ck] = (dfr, msg)
+                        _OBS_DIRECT_CACHE[direct_ck] = (dfr, msg)
                     return dfr, msg, sec
                 fail_reason = "정시데이터없음(0건)"
         except Exception as e:
-            fail_reason = _format_req_error(e, 15)
+            fail_reason = _format_req_error(e, read_to)
             if _is_conn_error(e) and _record_kma_conn_failure(fail_reason):
                 break
-        if attempt == 0:
-            time.sleep(0.8)
+        if attempt + 1 < max_retries:
+            time.sleep(0.6)
 
     if not _is_kma_down():
         with _LOCK:
-            any_asos = any((aid, date_str) in _OBS_CACHE for aid in ASOS_HUBS.keys())
+            any_asos = any((aid, date_str) in _OBS_DIRECT_CACHE for aid in ASOS_HUBS.keys())
         if not any_asos:
             prefetch_kma_asos_batch(date_str, auth_key)
 
     dfb, msg_b = _interpolate_from_cached_asos(stn_info, date_str, fail_reason)
     sec = time.time() - t0
     with _LOCK:
-        _OBS_CACHE[ck] = (dfb, msg_b)
+        _OBS_FALLBACK_CACHE[fb_ck] = (dfb, msg_b)
     return dfb, msg_b, sec
 
-def prefetch_kma_obs_batch(station_names, date_str, auth_key, max_workers=2):
+def prefetch_kma_obs_batch(station_names, date_str, auth_key, max_workers=2, max_total_sec=180.0):
     if not auth_key:
         return 0.0, 0.0, 0, 0, 0, [], False
     t0 = time.time()
+    deadline_ts = time.monotonic() + max_total_sec
     asos_sec, asos_ok, _ = prefetch_kma_asos_batch(date_str, auth_key)
     aws_list = [n for n in station_names if JEJU_STATIONS[n]["type"] != "ASOS"]
 
@@ -1574,17 +1629,22 @@ def prefetch_kma_obs_batch(station_names, date_str, auth_key, max_workers=2):
         fail_msg = f"기상청 회로차단(ASOS 연결실패:{reason})"
         with _LOCK:
             for reg in aws_list:
-                _OBS_CACHE[(JEJU_STATIONS[reg]["stn"], date_str)] = (pd.DataFrame(), fail_msg)
+                _OBS_FALLBACK_CACHE[(reg, JEJU_STATIONS[reg]["stn"], date_str)] = (pd.DataFrame(), fail_msg)
         total_sec = time.time() - t0
         return total_sec, asos_sec, asos_ok, 0, 0, [("전역차단", 0, round(total_sec, 2), fail_msg)], True
 
     aws_dir, aws_int, fail_logs = 0, 0, []
+    done_cnt = 0
     if aws_list:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            fut_map = {pool.submit(fetch_kma_obs_v8, JEJU_STATIONS[n], date_str, auth_key): n for n in aws_list}
+            fut_map = {
+                pool.submit(fetch_kma_obs_v8, JEJU_STATIONS[n], date_str, auth_key, n, deadline_ts): n
+                for n in aws_list
+            }
             for f in as_completed(fut_map):
                 reg = fut_map[f]
                 stn_id = JEJU_STATIONS[reg]["stn"]
+                done_cnt += 1
                 try:
                     df_r, msg_r, sec_r = f.result()
                     if not df_r.empty and "직접 관측" in msg_r:
@@ -1595,11 +1655,13 @@ def prefetch_kma_obs_batch(station_names, date_str, auth_key, max_workers=2):
                         fail_logs.append((reg, stn_id, round(sec_r, 2), msg_r))
                 except Exception as e:
                     fail_logs.append((reg, stn_id, 0.0, f"스레드예외:{type(e).__name__}"))
+                if done_cnt % 10 == 0 or done_cnt == len(aws_list):
+                    print(f"   ... KMA AWS 진행 {done_cnt}/{len(aws_list)} (직접 {aws_dir} · 보간 {aws_int} · 경과 {time.time()-t0:.1f}s)", flush=True)
 
     return time.time() - t0, asos_sec, asos_ok, aws_dir, aws_int, fail_logs, _is_kma_down()
 
 # ==========================================
-# [5. v9.2 공정 4중 채점 (풍속 미수신 L2/L3 모델 중립 호환)]
+# [5. v9.4 공정 4중 채점 (풍속 미수신 L2/L3 모델 중립 호환)]
 # ==========================================
 def evaluate_4way_fair(df_eval, candidate_models, df_obs):
     metrics, scored_keys = {}, []
@@ -1636,7 +1698,6 @@ def evaluate_4way_fair(df_eval, candidate_models, df_obs):
     if not scored_keys:
         return {}, metrics
 
-    # 풍속을 생략한 경량 모델(예: NASA L2/L3)은 풍속 오차를 참여 모델 중앙값으로 중립 처리
     w_valid_vals = [metrics[k]['wind_mae'] for k in scored_keys if metrics[k].get('has_wind')]
     med_w_mae = round(float(np.median(w_valid_vals)), 2) if w_valid_vals else 1.5
     for k in scored_keys:
@@ -1729,13 +1790,23 @@ def _synthesize_ensemble_df(df_mod, model_keys, cum_weights, metrics, active_thr
     out['Rain_Consensus'], out['Action_Tag'] = consensus_list, action_tag_list
     return out
 
+def _station_id_changed(reg_data, current_stn_id):
+    stored_id = reg_data.get("stn_id")
+    if stored_id is not None and int(stored_id) != int(current_stn_id):
+        return True
+    m = re.search(r'지점\s+(\d+)', str(reg_data.get("obs_source", "")))
+    if m and int(m.group(1)) != int(current_stn_id):
+        return True
+    return False
+
 # ==========================================
-# [6. v9.2 통합 파이프라인 (NASA는 항상 배치캐시 0ms만 참조)]
+# [6. v9.4 통합 파이프라인 (웹 Read-Only 0ms KMA / 배치 전용 갱신)]
 # ==========================================
 def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=True, progress_cb=None, log_cb=None):
     t_pipe_start = time.time()
     is_batch_mode = "--auto-update" in sys.argv
-    load_cached_jeju_aws_stations()
+    if not _AWS_CACHE_LOADED:
+        load_cached_jeju_aws_stations()
     stn_info = JEJU_STATIONS.get(matched_key, JEJU_STATIONS[DEFAULT_REGION])
     now_kst = datetime.now(KST).replace(tzinfo=None)
     today_date = now_kst.date()
@@ -1749,11 +1820,13 @@ def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=T
     active_models, model_max_hours, prob_source_map = {}, {}, {}
     om_keys = [k for k in MODELS.keys() if k != "nasa_geos_fp"]
     if progress_cb:
-        progress_cb(15, "🌍 [1/4] Open-Meteo 10대 글로벌 모델 로드 중...")
+        progress_cb(20, "🌍 [1/3] Open-Meteo 10대 최신 예보 로드 중...")
 
+    # 웹 모드는 최신 예보 조회만 수행(past_days=0으로 페이로드 경량화), 배치는 어제 채점용(past_days=2)
+    om_past_days = 2 if is_batch_mode else 0
     t_om0 = time.time()
     df_mod, loaded_om, mh_om, om_status, om_msg, om_ms, om_cached = fetch_open_meteo_resilient(
-        stn_info["lat"], stn_info["lon"], om_keys, past_days=2, now_kst=now_kst
+        stn_info["lat"], stn_info["lon"], om_keys, past_days=om_past_days, now_kst=now_kst
     )
     t_om_sec = time.time() - t_om0
     if df_mod.empty:
@@ -1775,7 +1848,7 @@ def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=T
     nasa_sec, nasa_note, nasa_loaded = 0.0, "기본 미사용 (토글 시 배치캐시 0ms 로드)", False
     if include_nasa:
         if progress_cb:
-            progress_cb(50, "🛰️ [2/4] NASA GEOS-FP 배치캐시 0ms 로드 중...")
+            progress_cb(55, "🛰️ [2/3] NASA GEOS-FP 배치캐시 0ms 로드 중...")
         df_nasa, nasa_sec, nasa_note, nasa_has_rain = fetch_nasa_geos_cache_only(stn_info["lat"], stn_info["lon"])
         if not df_nasa.empty and not df_mod.empty:
             df_na = df_nasa.reindex(df_mod.index)
@@ -1799,21 +1872,15 @@ def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=T
     else:
         SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": "⏸️ 선택미사용", "max_hours": 0, "latency_s": 0.0, "note": nasa_note}
         if progress_cb:
-            progress_cb(50, "⚡ [2/4] 기본 10대 고속 모드 (NASA 생략)...")
-
-    snap_saved_now = save_forecast_snapshot(matched_key, today_date, now_kst, df_mod, active_models)
-
-    if progress_cb:
-        progress_cb(75, f"📡 [3/4] 기상청 '{matched_key}' 어제 실측 & 임계값 보정 중...")
-    df_obs_y, obs_source_msg, kma_sec = fetch_kma_obs_v8(stn_info, yesterday_str, KMA_AUTH_KEY)
+            progress_cb(55, "⚡ [2/3] 기본 10대 고속 모드 (배치 고정 가중치·임계값 0ms 로드)...")
 
     if df_mod.empty or not active_models:
-        timings = {"om": round(t_om_sec, 2), "nasa": round(nasa_sec, 2), "kma": round(kma_sec, 2), "total": round(time.time() - t_pipe_start, 2)}
+        timings = {"om": round(t_om_sec, 2), "nasa": round(nasa_sec, 2), "kma": 0.0, "total": round(time.time() - t_pipe_start, 2)}
         if progress_cb:
             progress_cb(100, "⚠️ 기상 모델 응답 지연")
         return {
             "region_name": matched_key, "station_info": stn_info, "now_kst": now_kst, "yesterday_str": yesterday_str,
-            "obs_source_msg": obs_source_msg, "eval_mode_msg": "모델 응답 지연", "obs_summary": {},
+            "obs_source_msg": "-", "eval_mode_msg": "모델 응답 지연", "obs_summary": {},
             "weight_status_msg": f"⚠️ Open-Meteo 응답 지연 ({om_msg})", "active_models": {}, "model_max_hours": {},
             "prob_source_map": {}, "loaded_om_cnt": 0, "metrics": {}, "cum_weights": {}, "prev_weights": {},
             "daily_weights": {}, "df_future_all": pd.DataFrame(), "run_error_count": run_error_count + 1,
@@ -1821,88 +1888,138 @@ def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=T
             "include_nasa": include_nasa, "nasa_loaded": False, "nasa_note": nasa_note, "nasa_comparison": None, "timings": timings
         }
 
-    df_snap_y, eval_mode_msg = load_snapshot_for_date(matched_key, yesterday_date)
-    if not df_snap_y.empty:
-        df_eval, eval_candidates = df_snap_y, list(MODELS.keys())
-    else:
-        y_start = pd.Timestamp(yesterday_date)
-        df_eval = df_mod[(df_mod.index >= y_start) & (df_mod.index <= y_start + pd.Timedelta(hours=23))]
-        eval_candidates = [k for k in active_models.keys() if k != "nasa_geos_fp"]
+    # ------------------------------------------------------------
+    # [분기 A: 웹 모드(Read-Only)] — KMA 호출·채점·임계값 재계산 전면 생략 (0.00s)
+    # ------------------------------------------------------------
+    if not is_batch_mode:
+        kma_sec = 0.0
+        snap_saved_now = False
+        reg_data = history.get(matched_key)
+        all_keys = list(MODELS.keys())
+        eq_w = round(100.0 / len(all_keys), 2)
 
-    daily_weights, metrics = evaluate_4way_fair(df_eval, eval_candidates, df_obs_y)
-    for k in MODELS.keys():
-        if k not in metrics:
-            metrics[k] = {'scored': False, 'eval_hours': 0, 'has_wind': False, 'temp_mae': 0.0, 'temp_bias': 0.0, 'rain_mae': 0.0, 'prob_brier': 0.0, 'wind_mae': 0.0, 'wind_bias': 0.0, 'score_temp': 0.0, 'score_prob': 0.0, 'score_rain': 0.0, 'score_wind': 0.0}
-
-    obs_summary = {}
-    if not df_obs_y.empty:
-        obs_summary = {
-            "obs_hours": len(df_obs_y),
-            "temp_avg": round(float(df_obs_y['obs_temp'].mean()), 1),
-            "temp_min": round(float(df_obs_y['obs_temp'].min()), 1),
-            "temp_max": round(float(df_obs_y['obs_temp'].max()), 1),
-            "rain_sum": round(float(df_obs_y['obs_rain'].sum()), 1),
-            "wind_avg": round(float(df_obs_y['obs_wind'].mean()), 1),
-            "wind_max": round(float(df_obs_y['obs_wind'].max()), 1)
-        }
-
-    all_keys = list(MODELS.keys())
-    has_new_scores = len(daily_weights) > 0
-
-    if matched_key not in history or history[matched_key].get("rule_version") != WEIGHT_RULE_VERSION:
-        eq_init = {m: round(100.0 / len(all_keys), 2) for m in all_keys}
-        aligned_prev, new_cum = update_weights_fair(eq_init, daily_weights, all_keys)
-        history[matched_key] = {
-            "created_date": today_str, "last_updated": today_str if has_new_scores else "PENDING",
-            "update_count": 1 if has_new_scores else 0, "rule_version": WEIGHT_RULE_VERSION,
-            "eval_mode": eval_mode_msg, "prev_weights": aligned_prev, "daily_weights": daily_weights,
-            "cumulative_weights": new_cum, "latest_metrics": metrics, "obs_source": obs_source_msg,
-            "obs_summary": obs_summary, "last_error_count": run_error_count if has_new_scores else run_error_count + 1
-        }
-        top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
-        if has_new_scores:
-            write_audit_log(matched_key, yesterday_str, "v8신규초기화", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
-            weight_status_msg = f"🆕 v9.2 공정 가중치 장부 생성 완료 ({len(daily_weights)}개 모델 실측 채점)"
-        else:
-            if is_batch_mode:
-                write_audit_log(matched_key, yesterday_str, "관측미수신(초기동결)", eval_mode_msg[:18], obs_source_msg, 0, run_error_count + 1, MODELS[top_m]["name"], top_w)
-            weight_status_msg = "⏸️ 기상청 미수신으로 초기 균등 가중치 동결 (복구 시 자동 채점)"
-    else:
-        reg_data = history[matched_key]
-        if reg_data.get("last_updated") != today_str:
-            if has_new_scores:
-                aligned_prev, new_cum = update_weights_fair(reg_data.get("cumulative_weights", {}), daily_weights, all_keys)
-                reg_data["update_count"] = reg_data.get("update_count", 0) + 1
-                reg_data.update({"prev_weights": aligned_prev, "daily_weights": daily_weights, "cumulative_weights": new_cum, "last_updated": today_str, "eval_mode": eval_mode_msg})
-                top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
-                write_audit_log(matched_key, yesterday_str, f"갱신({reg_data['update_count']}일차)", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
-                weight_status_msg = f"🔄 일일 가중치 갱신 완료 (누적 {reg_data['update_count']}일 차, {len(daily_weights)}개 채점)"
-            else:
-                cw_map = reg_data.get("cumulative_weights", {})
-                top_m, top_w = max(cw_map.items(), key=lambda x: x[1]) if cw_map else ("ecmwf_ifs025", 9.1)
-                if is_batch_mode:
-                    write_audit_log(matched_key, yesterday_str, "관측미수신(가중치동결)", eval_mode_msg[:18], obs_source_msg, 0, run_error_count + 1, MODELS[top_m]["name"], top_w)
-                weight_status_msg = f"⏸️ 기상청 미수신으로 기존 가중치 동결 (누적 {reg_data.get('update_count', 0)}일 차 · 복구 시 채점)"
-        else:
-            weight_status_msg = f"🔒 오늘({today_str}) 가중치 갱신 완료 상태 (누적 {reg_data.get('update_count', 1)}일 차 유지)"
-
-        if has_new_scores:
-            reg_data.update({"latest_metrics": metrics, "obs_source": obs_source_msg, "obs_summary": obs_summary, "last_error_count": run_error_count})
-        elif reg_data.get("last_updated") == today_str and reg_data.get("latest_metrics"):
-            metrics = reg_data["latest_metrics"]
+        if (
+            isinstance(reg_data, dict)
+            and reg_data.get("rule_version") == WEIGHT_RULE_VERSION
+            and not _station_id_changed(reg_data, stn_info["stn"])
+            and reg_data.get("cumulative_weights")
+        ):
+            cum_weights = reg_data["cumulative_weights"]
+            prev_weights = reg_data.get("prev_weights", cum_weights)
             daily_weights = reg_data.get("daily_weights", {})
-            obs_source_msg = reg_data.get("obs_source", obs_source_msg)
-            obs_summary = reg_data.get("obs_summary", obs_summary)
+            metrics = reg_data.get("latest_metrics") or _empty_metrics_dict()
+            obs_source_msg = reg_data.get("obs_source", f"지점 {stn_info['stn']} (배치 기록)")
+            obs_summary = reg_data.get("obs_summary", {})
+            eval_mode_msg = reg_data.get("eval_mode", "📸 배치 정석 채점")
+            last_upd = reg_data.get("last_updated", "-")
+            upd_cnt = reg_data.get("update_count", 0)
+            weight_status_msg = f"🔒 배치 고정 가중치·임계값 적용 (기준 {last_upd} · 누적 {upd_cnt}일 차 · 다음 갱신 {BATCH_SCHEDULE_LABEL})"
+        else:
+            cum_weights = {m: eq_w for m in all_keys}
+            prev_weights = dict(cum_weights)
+            daily_weights = {}
+            metrics = _empty_metrics_dict()
+            obs_source_msg = f"지점 {stn_info['stn']} (최초 배치 수집 대기)"
+            obs_summary = {}
+            eval_mode_msg = f"⏳ 최초 배치 대기 ({BATCH_SCHEDULE_LABEL} 자동 채점)"
+            weight_status_msg = f"⚖️ 균등 기본 가중치 적용 중 ({BATCH_SCHEDULE_LABEL} 배치 실행 후 자동 고정)"
 
-    cum_weights = history[matched_key]["cumulative_weights"]
-    prev_weights = history[matched_key]["prev_weights"]
-    active_thresholds = record_calibration_samples_and_update(
-        matched_key, df_eval, df_obs_y, eval_candidates, cum_weights, eval_mode_msg,
-        recompute_global=recompute_global_cal
-    )
+        active_thresholds = get_active_thresholds(matched_key)
+
+    # ------------------------------------------------------------
+    # [분기 B: 배치 모드(--auto-update)] — 스냅샷 저장 · 기상청 실측 채점 · 임계값 갱신
+    # ------------------------------------------------------------
+    else:
+        snap_saved_now = save_forecast_snapshot(matched_key, today_date, now_kst, df_mod, active_models)
+        df_obs_y, obs_source_msg, kma_sec = fetch_kma_obs_v8(stn_info, yesterday_str, KMA_AUTH_KEY, stn_name=matched_key)
+
+        df_snap_y, eval_mode_msg = load_snapshot_for_date(matched_key, yesterday_date)
+        if not df_snap_y.empty:
+            df_eval, eval_candidates = df_snap_y, list(MODELS.keys())
+        else:
+            y_start = pd.Timestamp(yesterday_date)
+            df_eval = df_mod[(df_mod.index >= y_start) & (df_mod.index <= y_start + pd.Timedelta(hours=23))]
+            eval_candidates = [k for k in active_models.keys() if k != "nasa_geos_fp"]
+
+        daily_weights, metrics = evaluate_4way_fair(df_eval, eval_candidates, df_obs_y)
+        for k in MODELS.keys():
+            if k not in metrics:
+                metrics[k] = _empty_metrics_dict()[k]
+
+        obs_summary = {}
+        if not df_obs_y.empty:
+            obs_summary = {
+                "obs_hours": len(df_obs_y),
+                "temp_avg": round(float(df_obs_y['obs_temp'].mean()), 1),
+                "temp_min": round(float(df_obs_y['obs_temp'].min()), 1),
+                "temp_max": round(float(df_obs_y['obs_temp'].max()), 1),
+                "rain_sum": round(float(df_obs_y['obs_rain'].sum()), 1),
+                "wind_avg": round(float(df_obs_y['obs_wind'].mean()), 1),
+                "wind_max": round(float(df_obs_y['obs_wind'].max()), 1)
+            }
+
+        all_keys = list(MODELS.keys())
+        has_new_scores = len(daily_weights) > 0
+        need_init = (
+            matched_key not in history
+            or history[matched_key].get("rule_version") != WEIGHT_RULE_VERSION
+            or _station_id_changed(history[matched_key], stn_info["stn"])
+        )
+
+        if need_init:
+            eq_init = {m: round(100.0 / len(all_keys), 2) for m in all_keys}
+            aligned_prev, new_cum = update_weights_fair(eq_init, daily_weights, all_keys)
+            history[matched_key] = {
+                "stn_id": stn_info["stn"],
+                "created_date": today_str, "last_updated": today_str if has_new_scores else "PENDING",
+                "update_count": 1 if has_new_scores else 0, "rule_version": WEIGHT_RULE_VERSION,
+                "eval_mode": eval_mode_msg, "prev_weights": aligned_prev, "daily_weights": daily_weights,
+                "cumulative_weights": new_cum, "latest_metrics": metrics, "obs_source": obs_source_msg,
+                "obs_summary": obs_summary, "last_error_count": run_error_count if has_new_scores else run_error_count + 1
+            }
+            top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
+            if has_new_scores:
+                write_audit_log(matched_key, yesterday_str, "v9공식지점초기화", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
+                weight_status_msg = f"🆕 v9.4 공식 지점({stn_info['stn']}) 가중치 장부 생성 완료 ({len(daily_weights)}개 채점)"
+            else:
+                write_audit_log(matched_key, yesterday_str, "관측미수신(초기동결)", eval_mode_msg[:18], obs_source_msg, 0, run_error_count + 1, MODELS[top_m]["name"], top_w)
+                weight_status_msg = "⏸️ 기상청 미수신으로 초기 균등 가중치 동결 (복구 시 자동 채점)"
+        else:
+            reg_data = history[matched_key]
+            reg_data["stn_id"] = stn_info["stn"]
+            if reg_data.get("last_updated") != today_str:
+                if has_new_scores:
+                    aligned_prev, new_cum = update_weights_fair(reg_data.get("cumulative_weights", {}), daily_weights, all_keys)
+                    reg_data["update_count"] = reg_data.get("update_count", 0) + 1
+                    reg_data.update({"prev_weights": aligned_prev, "daily_weights": daily_weights, "cumulative_weights": new_cum, "last_updated": today_str, "eval_mode": eval_mode_msg})
+                    top_m, top_w = max(new_cum.items(), key=lambda x: x[1])
+                    write_audit_log(matched_key, yesterday_str, f"갱신({reg_data['update_count']}일차)", eval_mode_msg[:18], obs_source_msg, len(daily_weights), run_error_count, MODELS[top_m]["name"], top_w)
+                    weight_status_msg = f"🔄 일일 가중치 갱신 완료 (누적 {reg_data['update_count']}일 차, {len(daily_weights)}개 채점)"
+                else:
+                    cw_map = reg_data.get("cumulative_weights", {})
+                    top_m, top_w = max(cw_map.items(), key=lambda x: x[1]) if cw_map else ("ecmwf_ifs025", 9.1)
+                    write_audit_log(matched_key, yesterday_str, "관측미수신(가중치동결)", eval_mode_msg[:18], obs_source_msg, 0, run_error_count + 1, MODELS[top_m]["name"], top_w)
+                    weight_status_msg = f"⏸️ 기상청 미수신으로 기존 가중치 동결 (누적 {reg_data.get('update_count', 0)}일 차)"
+            else:
+                weight_status_msg = f"🔒 오늘({today_str}) 가중치 갱신 완료 상태 (누적 {reg_data.get('update_count', 1)}일 차 유지)"
+
+            if has_new_scores:
+                reg_data.update({"latest_metrics": metrics, "obs_source": obs_source_msg, "obs_summary": obs_summary, "last_error_count": run_error_count})
+            elif reg_data.get("last_updated") == today_str and reg_data.get("latest_metrics"):
+                metrics = reg_data["latest_metrics"]
+                daily_weights = reg_data.get("daily_weights", {})
+                obs_source_msg = reg_data.get("obs_source", obs_source_msg)
+                obs_summary = reg_data.get("obs_summary", obs_summary)
+
+        cum_weights = history[matched_key]["cumulative_weights"]
+        prev_weights = history[matched_key]["prev_weights"]
+        active_thresholds = record_calibration_samples_and_update(
+            matched_key, df_eval, df_obs_y, eval_candidates, cum_weights, eval_mode_msg,
+            recompute_global=recompute_global_cal
+        )
 
     if progress_cb:
-        progress_cb(92, "✨ [4/4] 영점 보정 및 4단계 행동신호 합성 중...")
+        progress_cb(90, "✨ [3/3] 영점 보정 및 4단계 행동신호 합성 중...")
 
     df_synth = _synthesize_ensemble_df(df_mod, list(active_models.keys()), cum_weights, metrics, active_thresholds)
     df_future_all = df_synth[df_synth.index >= now_kst].dropna(subset=['Ensemble_Temp'])
@@ -1926,10 +2043,11 @@ def run_station_pipeline(matched_key, include_nasa=False, recompute_global_cal=T
                 "nasa_note": nasa_note
             }
 
-    history[matched_key]["avg_rain_consensus_48h"] = round(float(df_future_all.head(48)['Rain_Consensus'].mean()), 1) if not df_future_all.empty else 0.0
-    history[matched_key]["thresholds"] = active_thresholds
-    with open(WEIGHT_HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+    if is_batch_mode:
+        history[matched_key]["avg_rain_consensus_48h"] = round(float(df_future_all.head(48)['Rain_Consensus'].mean()), 1) if not df_future_all.empty else 0.0
+        history[matched_key]["thresholds"] = active_thresholds
+        with open(WEIGHT_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
 
     timings = {"om": round(t_om_sec, 2), "nasa": round(nasa_sec, 2), "kma": round(kma_sec, 2), "total": round(time.time() - t_pipe_start, 2)}
     if progress_cb:
@@ -1997,7 +2115,8 @@ def _extract_date_from_question(question, today_date):
     return None
 
 def _match_station_in_question(question):
-    load_cached_jeju_aws_stations()
+    if not _AWS_CACHE_LOADED:
+        load_cached_jeju_aws_stations()
     names = sorted(JEJU_STATIONS.keys(), key=len, reverse=True)
     for name in names:
         if name in question:
@@ -2022,11 +2141,6 @@ def build_dynamic_qa_context(question, res):
 
     target_date = _extract_date_from_question(question, today_date)
     target_reg = _match_station_in_question(question)
-
-    if target_reg is None and not os.path.exists(AWS_STATIONS_CACHE_FILE) and KMA_AUTH_KEY:
-        auto_discover_jeju_aws_stations(KMA_AUTH_KEY, allow_network=True)
-        target_reg = _match_station_in_question(question)
-
     final_reg = target_reg or curr_reg
     extra_blocks = []
 
@@ -2050,10 +2164,13 @@ def build_dynamic_qa_context(question, res):
                 f"최대풍속 {df_ens_past['Ensemble_Wind'].max():.1f}m/s (강수예보: {wet_txt})"
             )
         else:
-            lines.append(f"- 과거 예보 스냅샷: {final_reg}의 {d_str} 저장 스냅샷 없음 (전체 관측소 자동 수집 도입 이전 날짜이거나 미수집일)")
+            lines.append(f"- 과거 예보 스냅샷: {final_reg}의 {d_str} 저장 스냅샷 없음")
 
+        # AI 과거 실측 질문에 한해 단건 경량 조회(1회 · 최대 8초)
         if stn_info and KMA_AUTH_KEY:
-            df_obs_p, obs_msg_p, _ = fetch_kma_obs_v8(stn_info, ymd, KMA_AUTH_KEY)
+            df_obs_p, obs_msg_p, _ = fetch_kma_obs_v8(
+                stn_info, ymd, KMA_AUTH_KEY, stn_name=final_reg, max_retries=1, read_to=6, hard_to=9
+            )
             if not df_obs_p.empty:
                 rain_h = df_obs_p[df_obs_p["obs_rain"] >= 0.1]
                 rain_txt = ", ".join(f"{idx.strftime('%H시')}({r['obs_rain']:.1f}mm)" for idx, r in rain_h.head(8).iterrows()) or "무강수(0.0mm)"
@@ -2082,7 +2199,7 @@ def build_dynamic_qa_context(question, res):
     elif target_reg is not None and target_reg != curr_reg and target_reg in JEJU_STATIONS:
         stn_o = JEJU_STATIONS[target_reg]
         om_keys = [k for k in MODELS.keys() if k != "nasa_geos_fp"]
-        df_o, ld_o, _, _, _, _, _ = fetch_open_meteo_resilient(stn_o["lat"], stn_o["lon"], om_keys, past_days=1, now_kst=now_kst)
+        df_o, ld_o, _, _, _, _, _ = fetch_open_meteo_resilient(stn_o["lat"], stn_o["lon"], om_keys, past_days=0, now_kst=now_kst)
         if not df_o.empty and ld_o:
             hist_db = _load_json_safe(WEIGHT_HISTORY_FILE, {})
             cw_o = hist_db.get(target_reg, {}).get("cumulative_weights", {})
@@ -2321,7 +2438,7 @@ def format_status_report():
     if isinstance(nasa_cache, dict) and nasa_cache.get("cells"):
         nasa_cache_line = f"{nasa_cache.get('run_label', '-')} | 수집 {nasa_cache.get('fetched_at', '-')} | {len(nasa_cache['cells'])}격자"
     else:
-        nasa_cache_line = "미생성 (Actions 배치 수집 대기 · 웹 실시간 호출 차단됨)"
+        nasa_cache_line = f"미생성 ({BATCH_SCHEDULE_LABEL} 배치 수집 대기 · 웹 실시간 호출 차단)"
 
     diag = _load_nasa_diag()
     rec_lvl = diag.get("recommended_level", 1)
@@ -2332,8 +2449,9 @@ def format_status_report():
 
     th_cfg = _load_json_safe(OPTIMAL_THRESHOLDS_FILE, {})
     g_th = th_cfg.get("global", DEFAULT_THRESHOLDS)
+    th_upd = th_cfg.get("updated_at", "-")
     th_line = (
-        f"{g_th.get('mode', '기본값')} | 표본 {g_th.get('days', 0)}/{CAL_MIN_DAYS}일 · "
+        f"{g_th.get('mode', '기본값')} (고정갱신 {th_upd}) | 표본 {g_th.get('days', 0)}/{CAL_MIN_DAYS}일 · "
         f"강수 {g_th.get('wet_hours', 0)}h | 확률 {g_th.get('prob_watch', 30):.0f}%/{g_th.get('prob_rain', 50):.0f}% · "
         f"모델합의 {int(g_th.get('yes_watch_ratio', 0.3)*100)}%/{int(g_th.get('yes_likely_ratio', 0.6)*100)}%"
     )
@@ -2344,17 +2462,18 @@ def format_status_report():
     hist_cnt = 0
     if os.path.exists(WEIGHT_HISTORY_FILE):
         history = _load_json_safe(WEIGHT_HISTORY_FILE, {})
-        hist_cnt = len(history)
-        ordered_regs = [r for r in CORE_STATION_NAMES if r in history] + sorted(r for r in history.keys() if r not in CORE_STATION_NAMES)
-        for reg in ordered_regs:
+        active_regs = [r for r in ASOS_HUB_NAMES if r in history] + sorted(r for r in history.keys() if r in JEJU_STATIONS and r not in ASOS_HUB_NAMES)
+        hist_cnt = len(active_regs)
+        for reg in active_regs:
             info = history[reg]
             w_map = info.get("cumulative_weights", {})
             top_m, top_w = max(w_map.items(), key=lambda x: x[1]) if w_map else ("-", 0)
-            reg_lines.append(f"• {reg}({info.get('update_count',0)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | {info.get('obs_source','-')[:32]}")
+            stn_tag = JEJU_STATIONS[reg]["stn"]
+            reg_lines.append(f"• {reg}[{stn_tag}]({info.get('update_count',0)}일차): 1위 {MODELS.get(top_m,{}).get('name',top_m)}({top_w:.1f}%) | {info.get('obs_source','-')[:32]}")
 
     return (
-        f"🖥️ [제주 기상 앙상블 v9.2 상태 · NASA 자동복구 & 임계값 대시보드]\n"
-        f"🕒 조회시각: {now_str} | 기상청키: {sec_kma} | 기상청회로: {kma_cb_txt} | 등록관측소: {len(JEJU_STATIONS)}개소\n"
+        f"🖥️ [제주 기상 앙상블 v9.4 상태 · 웹Read-Only & {BATCH_SCHEDULE_LABEL} 배치고정]\n"
+        f"🕒 조회시각: {now_str} | 기상청키: {sec_kma} | 기상청회로: {kma_cb_txt} | 공식관측소: {len(JEJU_STATIONS)}개소\n"
         f"🤖 공개 AI 엔진: {get_active_ai_provider_label()}\n"
         f"🛰️ NASA 선행캐시: {nasa_cache_line}\n"
         f"🛠️ NASA 자동복구: {nasa_diag_line}\n"
@@ -2364,51 +2483,55 @@ def format_status_report():
         f"━━━━━━━━━━━━━━━\n"
         f"📡 [1. API 통신 건전성]\n" + "\n".join(api_lines) + "\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"📍 [2. 지역별 1위 모델 & 관측소스 (누적 {hist_cnt}개소)]\n" + ("\n".join(reg_lines) if reg_lines else "• 지역명을 먼저 조회해 주세요.")
+        f"📍 [2. 공식 관측소별 1위 모델 & 관측소스 (누적 {hist_cnt}개소)]\n" + ("\n".join(reg_lines) if reg_lines else "• 배치 실행 후 자동 누적됩니다.")
     )
 
 # ==========================================
-# [8. GitHub Actions 무인 배치 모드 (--auto-update, 전체 관측소 + NASA 3단계 자동복구)]
+# [8. GitHub Actions 무인 배치 모드 (--auto-update, 매일 KST 06:42)]
 # ==========================================
 if "--auto-update" in sys.argv:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     t_all0 = time.time()
     now_kst_batch = datetime.now(KST).replace(tzinfo=None)
     yesterday_str_batch = (now_kst_batch.date() - timedelta(days=1)).strftime("%Y%m%d")
     om_keys_batch = [k for k in MODELS.keys() if k != "nasa_geos_fp"]
 
-    print(f"🚀 [무인 스케줄러 v9.2] 시작 | KMA_AUTH_KEY 감지: {bool(KMA_AUTH_KEY)} (길이: {len(KMA_AUTH_KEY)}자)")
+    print(f"🚀 [무인 스케줄러 v9.4] 시작 ({now_kst_batch.strftime('%Y-%m-%d %H:%M')} KST) | KMA_AUTH_KEY 감지: {bool(KMA_AUTH_KEY)} (길이: {len(KMA_AUTH_KEY)}자)", flush=True)
     aws_ext_cnt = auto_discover_jeju_aws_stations(KMA_AUTH_KEY, allow_network=True)
-    target_stations = list(JEJU_STATIONS.keys())
-    print(f"📍 [수집 대상] 전체 {len(target_stations)}개소 (핵심 {len(CORE_STATION_NAMES)} + 확장 {aws_ext_cnt} | KMA 6.3 주 1회 캐시)")
+    target_stations = list(ASOS_HUB_NAMES) + sorted(k for k in JEJU_STATIONS.keys() if k not in ASOS_HUB_NAMES)
+    print(f"📍 [수집 대상] 공식 전체 {len(target_stations)}개소 (ASOS {len(ASOS_HUB_NAMES)} + 공식 AWS {aws_ext_cnt} | 충돌·타도서 제거)", flush=True)
 
     # 1) Open-Meteo 전체 관측소 다중 청크 수집
     om_sec, om_ok, om_note = prefetch_open_meteo_batch(
         target_stations, om_keys_batch, past_days=2, now_kst=now_kst_batch, chunk_size=8, chunk_delay=1.0
     )
-    print(f"⏱️ [프리페치 1/3] Open-Meteo 다중좌표 일괄수집: {om_sec:.2f}s ({om_ok}/{len(target_stations)}개소 적재 | {om_note})")
+    print(f"⏱️ [프리페치 1/3] Open-Meteo 다중좌표 일괄수집: {om_sec:.2f}s ({om_ok}/{len(target_stations)}개소 적재 | {om_note})", flush=True)
 
     # 2) NASA GEOS-FP 3단계 적응형 오류수집·자동복구 선행 캐시 수집
     nasa_ok_batch, nasa_batch_sec, nasa_batch_msg = prefetch_nasa_jeju_grid_cache_adaptive()
     nasa_diag_after = _load_nasa_diag()
-    print(f"⏱️ [프리페치 2/3] NASA GEOS-FP 적응형 캐시: {nasa_batch_sec:.2f}s | {nasa_batch_msg}")
-    print(f"🛠️ [NASA 자동복구 진단] 상태: {nasa_diag_after['last_status']} | 권장단계: L{nasa_diag_after['recommended_level']} | 연속실패: {nasa_diag_after['consecutive_full_fails']}회 | 조치: {nasa_diag_after['last_action']}")
+    print(f"⏱️ [프리페치 2/3] NASA GEOS-FP 적응형 캐시: {nasa_batch_sec:.2f}s | {nasa_batch_msg}", flush=True)
+    print(f"🛠️ [NASA 자동복구 진단] 상태: {nasa_diag_after['last_status']} | 권장단계: L{nasa_diag_after['recommended_level']} | 연속실패: {nasa_diag_after['consecutive_full_fails']}회 | 조치: {nasa_diag_after['last_action']}", flush=True)
 
-    # 3) 기상청 ASOS 1회 일괄 + 전체 AWS 2스레드 수집
+    # 3) 기상청 ASOS 1회 일괄 + 공식 전체 AWS 2스레드 수집 (전체 180초 상한 + 건별 20초 HardDeadline)
     kma_sec, asos_sec, asos_ok, aws_dir, aws_int, aws_fails, kma_tripped = prefetch_kma_obs_batch(
-        target_stations, yesterday_str_batch, KMA_AUTH_KEY, max_workers=2
+        target_stations, yesterday_str_batch, KMA_AUTH_KEY, max_workers=2, max_total_sec=180.0
     )
     aws_total = sum(1 for n in target_stations if JEJU_STATIONS[n]["type"] != "ASOS")
     cb_badge = " | ⛔ 회로차단 작동(남은 호출 생략)" if kma_tripped else ""
-    print(f"⏱️ [프리페치 3/3] 기상청 어제({yesterday_str_batch}) 실측수집: {kma_sec:.2f}s (ASOS 1회일괄 {asos_ok}/4개소 {asos_sec:.2f}s + AWS 직접 {aws_dir}/{aws_total} · 보간 {aws_int}/{aws_total}){cb_badge}")
+    print(f"⏱️ [프리페치 3/3] 기상청 어제({yesterday_str_batch}) 실측수집: {kma_sec:.2f}s (ASOS 1회일괄 {asos_ok}/4개소 {asos_sec:.2f}s + AWS 직접 {aws_dir}/{aws_total} · 보간 {aws_int}/{aws_total}){cb_badge}", flush=True)
     if aws_fails:
-        print(f"⚠️ [기상청 관측 보간/실패 진단 ({len(aws_fails)}개소)]")
+        print(f"⚠️ [기상청 관측 보간/실패 진단 ({len(aws_fails)}개소)]", flush=True)
         for f_reg, f_stn, f_sec, f_msg in aws_fails[:20]:
             stn_txt = f"지점 {f_stn}, " if f_stn else ""
-            print(f"   - {f_reg}({stn_txt}{f_sec:.2f}s): {f_msg}")
+            print(f"   - {f_reg}({stn_txt}{f_sec:.2f}s): {f_msg}", flush=True)
         if len(aws_fails) > 20:
-            print(f"   ... 외 {len(aws_fails) - 20}개소 생략")
+            print(f"   ... 외 {len(aws_fails) - 20}개소 생략", flush=True)
 
-    # 4) 전 관측소 스냅샷 저장 및 실측 채점 (NASA는 선행캐시 0.00s 로드)
+    # 4) 공식 전 관측소 스냅샷 저장 · 가중치 갱신 · 임계값 고정 산출
     t_loop0, snap_cnt, last_th = time.time(), 0, DEFAULT_THRESHOLDS
     total_n = len(target_stations)
     for idx, reg in enumerate(target_stations, 1):
@@ -2419,23 +2542,24 @@ if "--auto-update" in sys.argv:
             last_th = r_obj.get("thresholds", last_th)
             nasa_ok = "NASA:OK" if r_obj.get("nasa_loaded") else "NASA:미수신"
             tm = r_obj["timings"]
-            print(f" -> [{idx:02d}/{total_n}] '{reg}' | OM:{r_obj['loaded_om_cnt']}/10 {nasa_ok} | 채점:{len(r_obj['daily_weights'])}개 | 소요 {tm['total']:.2f}s | {r_obj['obs_source_msg']}")
+            print(f" -> [{idx:02d}/{total_n}] '{reg}[{JEJU_STATIONS[reg]['stn']}]' | OM:{r_obj['loaded_om_cnt']}/10 {nasa_ok} | 채점:{len(r_obj['daily_weights'])}개 | 소요 {tm['total']:.2f}s | {r_obj['obs_source_msg']}", flush=True)
         except Exception as e:
-            print(f" ⚠️ [{idx:02d}/{total_n}] '{reg}' 예외 발생: {e}")
+            print(f" ⚠️ [{idx:02d}/{total_n}] '{reg}' 예외 발생: {e}", flush=True)
 
     nasa_st = SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (배치전용캐시)"]
-    print(f"🛰️ [NASA 최종상태] {nasa_st['status']} ({nasa_st['latency_ms']}ms) - {nasa_st['msg']}")
-    print(f"🎯 [임계값 보정] {last_th['mode']} | 표본 {last_th['days']}/{CAL_MIN_DAYS}일 · 강수 {last_th['wet_hours']}h | 확률 {last_th['prob_watch']:.0f}%/{last_th['prob_rain']:.0f}% · 합의 {int(last_th['yes_watch_ratio']*100)}%/{int(last_th['yes_likely_ratio']*100)}%")
-    print(f"✅ [무인 스케줄러 v9.2 완료] 총 {time.time() - t_all0:.2f}s (OM {om_sec:.2f}s + NASA캐시 {nasa_batch_sec:.2f}s + KMA {kma_sec:.2f}s + 채점 {time.time() - t_loop0:.2f}s | 신규스냅샷 {snap_cnt}/{total_n}개소)")
+    print(f"🛰️ [NASA 최종상태] {nasa_st['status']} ({nasa_st['latency_ms']}ms) - {nasa_st['msg']}", flush=True)
+    print(f"🎯 [임계값 고정 완료] {last_th['mode']} | 표본 {last_th['days']}/{CAL_MIN_DAYS}일 · 강수 {last_th['wet_hours']}h | 확률 {last_th['prob_watch']:.0f}%/{last_th['prob_rain']:.0f}% · 합의 {int(last_th['yes_watch_ratio']*100)}%/{int(last_th['yes_likely_ratio']*100)}%", flush=True)
+    print(f"✅ [무인 스케줄러 v9.4 완료] 총 {time.time() - t_all0:.2f}s (OM {om_sec:.2f}s + NASA캐시 {nasa_batch_sec:.2f}s + KMA {kma_sec:.2f}s + 채점 {time.time() - t_loop0:.2f}s | 신규스냅샷 {snap_cnt}/{total_n}개소)", flush=True)
     sys.exit(0)
 
 # ==========================================
-# [9. 모바일 웹 앱 화면 (Streamlit UI)]
+# [9. 모바일 웹 앱 화면 (Streamlit UI — Read-Only 0ms KMA)]
 # ==========================================
 import streamlit as st
 
-st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v9.2", page_icon="🌴", layout="wide")
-load_cached_jeju_aws_stations()
+st.set_page_config(page_title="제주 맞춤형 기상 앙상블 v9.4", page_icon="🌴", layout="wide")
+# 웹 기동 시 네트워크 호출 없이 로컬 캐시만 0ms 로드
+_, _, _aws_is_v2 = load_cached_jeju_aws_stations()
 
 st.markdown(
     """
@@ -2469,8 +2593,8 @@ def _sync_fav_query_params():
     elif "fav" in st.query_params:
         del st.query_params["fav"]
 
-st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v9.2")
-st.caption("전 관측소 스냅샷·채점 · 고속 10대 기본 · NASA 배치전용 0ms 캐시(3단계 자동복구) · 과거/타지역 AI 질답")
+st.markdown("### 🌴 제주도 지역별 맞춤형 기상 앙상블 v9.4")
+st.caption(f"웹 고속 Read-Only(KMA 0ms) · 공식 관측소 단일화 · 가중치/임계값/NASA {BATCH_SCHEDULE_LABEL} 자동 고정")
 
 tab_forecast, tab_ai, tab_status = st.tabs([
     "🌤️ 지역별 맞춤 예보",
@@ -2492,13 +2616,15 @@ with tab_forecast:
                     st.session_state["active_region"] = f_reg
                     st.rerun()
 
-    ordered_stations = fav_stations + [s for s in JEJU_STATIONS.keys() if s not in fav_stations]
+    asos_ordered = [s for s in ASOS_HUB_NAMES if s in JEJU_STATIONS and s not in fav_stations]
+    aws_ordered = sorted(s for s in JEJU_STATIONS.keys() if s not in fav_stations and s not in ASOS_HUB_NAMES)
+    ordered_stations = fav_stations + asos_ordered + aws_ordered
     curr_idx = ordered_stations.index(st.session_state["active_region"])
 
     col_sel, col_fav, col_btn = st.columns([3.2, 1.1, 1.2])
     with col_sel:
         selected_region = st.selectbox(
-            "📍 날씨를 확인할 제주 지역(관측소)을 선택하세요",
+            "📍 날씨를 확인할 제주 지역(공식 관측소)을 선택하세요",
             options=ordered_stations,
             index=curr_idx,
             format_func=lambda x: f"{'⭐ ' if x in fav_stations else ''}{x} (지점 {JEJU_STATIONS[x]['stn']} · {JEJU_STATIONS[x]['desc']})"
@@ -2540,7 +2666,7 @@ with tab_forecast:
         if run_clicked:
             reset_runtime_caches()
         mode_txt = "11대(NASA 배치캐시 포함)" if include_nasa else "10대(고속 기본)"
-        with st.status(f"🔄 [{selected_region}] {mode_txt} 로드 · 스냅샷 검증 · 4단계 신호 계산 중...", expanded=True) as status_box:
+        with st.status(f"🔄 [{selected_region}] {mode_txt} 최신 예보 로드 · 배치 고정 임계값 적용 중...", expanded=False) as status_box:
             p_bar = st.progress(0, text="초기화 중...")
             log_box = st.empty()
             logs = []
@@ -2555,7 +2681,7 @@ with tab_forecast:
             st.session_state["last_include_nasa"] = include_nasa
             tm = result["timings"]
             status_box.update(
-                label=f"✅ [{selected_region}] {mode_txt} 완료! (총 {tm['total']:.2f}s — OM {tm['om']:.2f}s / NASA {tm['nasa']:.2f}s / KMA {tm['kma']:.2f}s)",
+                label=f"✅ [{selected_region}] {mode_txt} 완료! (총 {tm['total']:.2f}s — OM {tm['om']:.2f}s / NASA {tm['nasa']:.2f}s / KMA 0.00s)",
                 state="complete", expanded=False
             )
 
@@ -2577,10 +2703,7 @@ with tab_forecast:
         pk24 = df_24h.loc[df_24h["Ensemble_Prob"].idxmax()]
 
         banner = f"**{res['eval_mode_msg']}** | 관측소: {res['obs_source_msg']} | {res['weight_status_msg']} | ⏱️ 총 {tm['total']:.2f}s"
-        if "기상청 미수신" in res["weight_status_msg"]:
-            st.warning(f"⚠️ {banner}")
-        else:
-            st.success(f"✅ {banner}")
+        st.success(f"✅ {banner}")
 
         if res.get("include_nasa"):
             cmp = res.get("nasa_comparison")
@@ -2633,7 +2756,7 @@ with tab_forecast:
 
         st.markdown(f"#### 🕒 2. [{selected_region}] 향후 48시간 시간별 상세 예측표")
         st.caption(
-            f"🎯 적용 임계값 [{th['mode']} · 표본 {th['days']}/{CAL_MIN_DAYS}일 · 강수 {th['wet_hours']}h] — "
+            f"🎯 배치 고정 임계값 [{th['mode']} · 표본 {th['days']}/{CAL_MIN_DAYS}일 · 강수 {th['wet_hours']}h] — "
             f"⚠️ 변덕주의: 확률 {th['prob_watch']:.0f}%↑ 또는 모델 {int(th['yes_watch_ratio']*100)}%↑ | "
             f"🌦️ 비 유동적: 확률 {th['prob_rain']:.0f}%↑(합의 미만) | "
             f"☔ 비 유력: 확률 {th['prob_rain']:.0f}%↑ & 모델 {int(th['yes_likely_ratio']*100)}%↑"
@@ -2675,7 +2798,7 @@ with tab_ai:
     res_ai = st.session_state.get("last_result")
     curr_reg = res_ai["region_name"] if res_ai else DEFAULT_REGION
     st.markdown(f"#### 🤖 [{curr_reg}] 예보 · 과거 실측 AI 질답 (누구나 무료 · 익명 세션)")
-    st.caption(f"현재 AI 엔진: {get_active_ai_provider_label()} | 다른 제주 지역이나 과거 날짜(예: '21일 성산 실측')도 질문할 수 있습니다.")
+    st.caption(f"현재 AI 엔진: {get_active_ai_provider_label()} | 다른 제주 지역이나 과거 날짜(예: '21일 안덕화순 실측')도 질문할 수 있습니다.")
 
     if "ai_chat_history" not in st.session_state:
         st.session_state["ai_chat_history"] = []
@@ -2731,18 +2854,17 @@ with tab_ai:
 
 with tab_status:
     st.markdown("#### 🖥️ 스냅샷 아카이브 · NASA 오류수집/자동복구 & 시스템 상태")
-    c_s1, c_s2 = st.columns(2)
-    with c_s1:
-        if st.button("🔄 기상청 추가 AWS 목록 동기화 (KMA 6.3 → 로컬캐시)", key="sync_aws_btn", use_container_width=True):
-            with st.spinner("기상청 제주 AWS 목록 동기화 중..."):
-                cnt = auto_discover_jeju_aws_stations(KMA_AUTH_KEY, allow_network=True, force=True)
-            st.success(f"✅ 확장 AWS {cnt}개소 동기화 완료 (총 {len(JEJU_STATIONS)}개소 등록)")
-    with c_s2:
-        if st.button("♻️ NASA 자동복구 단계 L1 초기화 (로컬 설정만 변경)", key="reset_nasa_lvl_btn", use_container_width=True):
-            reset_nasa_adaptive_level()
-            st.info("✅ 다음 GitHub Actions 배치부터 L1(6h·3변수·5×3격자)로 다시 시도합니다.")
+    if not _aws_is_v2:
+        st.warning("⚠️ 아직 구형 AWS 캐시(v1)가 로드된 상태입니다. GitHub Actions를 1회 실행하면 공식 v2 관측소 목록으로 영구 갱신됩니다.")
+    if st.button("🔄 기상청 공식 AWS 목록 동기화 (현재 웹 세션용)", key="sync_aws_btn", use_container_width=True):
+        with st.spinner("기상청 공식 제주 AWS 목록 동기화 중..."):
+            cnt = auto_discover_jeju_aws_stations(KMA_AUTH_KEY, allow_network=True, force=True)
+        st.success(f"✅ 공식 AWS {cnt}개소 동기화 완료 (총 {len(JEJU_STATIONS)}개소 등록)")
 
-    st.caption("ℹ️ NASA 수집은 GitHub Actions 배치에서만 실행되며 웹 실시간 호출은 비활성화되어 있습니다.")
+    st.caption(
+        f"ℹ️ 가중치·임계값·스냅샷·NASA 캐시는 모두 {BATCH_SCHEDULE_LABEL} GitHub Actions 배치에서만 갱신되고 웹에서는 고정값만 0ms로 읽습니다. "
+        "NASA L1 재초기화가 필요하면 저장소의 jeju_weather_data/nasa_diagnostics_v9.json에서 recommended_level을 1로 수정하세요."
+    )
     st.code(format_status_report())
 
     nasa_diag_view = _load_nasa_diag()
