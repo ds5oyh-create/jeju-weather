@@ -1,0 +1,66 @@
+{
+  "version": "v9.5",
+  "completed_at": "2026-11-25 22:58",
+  "schedule": "매일 KST 06:42",
+  "station_count": 41,
+  "total_sec": 125.51,
+  "overall": "warn",
+  "steps": [
+    {
+      "step": "1. 관측소 주소록",
+      "name": "KMA 6.3 공식 AWS 동기화",
+      "level": "ok",
+      "status": "✅ 정상",
+      "detail": "공식 41개소(ASOS 4 + AWS 37) · 갱신 2026-11-25 22:15",
+      "latency": "0.00s"
+    },
+    {
+      "step": "2. 글로벌 모델",
+      "name": "Open-Meteo 10대 일괄 수집",
+      "level": "ok",
+      "status": "✅ 정상",
+      "detail": "41/41개소 적재 (전체 일괄 성공)",
+      "latency": "6.15s"
+    },
+    {
+      "step": "3. NASA 선행캐시",
+      "name": "GEOS-FP 적응형 수집",
+      "level": "warn",
+      "status": "⚠️ 강등복구(L3)",
+      "detail": "L3 flx_Nx.latest (11/25 09시KST기준, 5파일×12h) · 1/1격자 · 27.06s (L3 정상 수집 (26.9s))",
+      "latency": "27.06s"
+    },
+    {
+      "step": "4. 기상청 실측",
+      "name": "전일(20261124) ASOS+AWS",
+      "level": "ok",
+      "status": "✅ 정상",
+      "detail": "ASOS 4/4 · AWS 직접 37/37 · 보간 0 · 실패 0",
+      "latency": "87.46s"
+    },
+    {
+      "step": "5. 스냅샷 아카이브",
+      "name": "당일 예보 스냅샷 저장",
+      "level": "ok",
+      "status": "✅ 정상",
+      "detail": "당일 41/41개소 보관 (신규/병합 0개소)",
+      "latency": "-"
+    },
+    {
+      "step": "6. 가중치 학습",
+      "name": "모델 채점 및 가중치 고정",
+      "level": "ok",
+      "status": "✅ 정상",
+      "detail": "41/41개소 당일 갱신 완료 (예외 0건)",
+      "latency": "4.82s"
+    },
+    {
+      "step": "7. 임계값 보정",
+      "name": "4단계 최적 임계값 산출",
+      "level": "ok",
+      "status": "✅ 고정완료",
+      "detail": "기본값(표본수집중) · 표본 3/7일 · 강수 249h",
+      "latency": "-"
+    }
+  ]
+}
