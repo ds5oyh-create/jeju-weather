@@ -2,7 +2,7 @@ name: Daily Jeju Weather Weight Updater
 
 on:
   schedule:
-    - cron: '5 16 * * *'
+    - cron: '42 21 * * *'   # KST 오전 06:42 (ECMWF 12Z 전모델 완료 + 정각 큐 회피)
   workflow_dispatch:
 
 permissions:
@@ -15,6 +15,7 @@ concurrency:
 jobs:
   update-weights:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: 1. 저장소 코드 불러오기
         uses: actions/checkout@v4
@@ -27,20 +28,22 @@ jobs:
       - name: 3. 필수 라이브러리 설치
         run: pip install -r requirements.txt
 
-      - name: 4. 제주 16개 관측소 스냅샷 저장 및 실측 채점
+      - name: 4. 제주 전 관측소 스냅샷·가중치·임계값·NASA 배치 갱신
         env:
           KMA_AUTH_KEY: ${{ secrets.KMA_AUTH_KEY }}
+          NASA_USER: ${{ secrets.NASA_USER }}
+          NASA_PASS: ${{ secrets.NASA_PASS }}
         run: |
           echo "KMA_AUTH_KEY length: ${#KMA_AUTH_KEY}"
-          python app.py --auto-update
+          PYTHONUNBUFFERED=1 python -u app.py --auto-update
 
-      - name: 5. 갱신된 장부·스냅샷·감사 로그 안전 저장
+      - name: 5. 갱신된 장부·스냅샷·임계값·캐시 안전 저장
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "JejuWeatherBot"
           git add jeju_weather_data/
           if ! git diff --staged --quiet; then
-            git commit -m "Auto-update daily ensemble weights and snapshots"
+            git commit -m "Auto-update daily ensemble weights, thresholds and caches"
             git pull --rebase --autostash origin main
             git push origin main
           fi
