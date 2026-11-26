@@ -1,9 +1,9 @@
 {
   "version": "v9.7",
-  "completed_at": "2026-11-27 00:50",
+  "completed_at": "2026-11-27 07:38",
   "schedule": "매일 KST 06:42",
   "station_count": 41,
-  "total_sec": 101.26,
+  "total_sec": 175.1,
   "overall": "ok",
   "steps": [
     {
@@ -20,23 +20,23 @@
       "level": "ok",
       "status": "✅ 정상",
       "detail": "41/41개소 적재 (전체 일괄 성공)",
-      "latency": "5.98s"
+      "latency": "6.11s"
     },
     {
       "step": "3. NASA 선행캐시",
       "name": "GEOS-FP 적응형 수집",
       "level": "ok",
       "status": "✅ 정상(L3 경량)",
-      "detail": "L3 flx_Nx.20261126_00Z (11/26 10시KST기준, 5파일×12h) · 1/1격자 · 19.01s (L3 정상 수집 (18.7s))",
-      "latency": "19.01s"
+      "detail": "L3 flx_Nx.latest (11/26 19시KST기준, 5파일×12h) · 1/1격자 · 29.17s (L3 정상 수집 (29.0s))",
+      "latency": "29.17s"
     },
     {
       "step": "4. 기상청 실측",
       "name": "전일(20261126) ASOS+AWS",
       "level": "ok",
       "status": "✅ 정상",
-      "detail": "ASOS 4/4 · AWS 직접 37/37 · 보간동결 0 · 실패 0",
-      "latency": "69.11s"
+      "detail": "ASOS 4/4 · AWS 직접 34/37 · 보간동결 3 · 실패 0",
+      "latency": "135.57s"
     },
     {
       "step": "5. 스냅샷 아카이브",
@@ -51,8 +51,8 @@
       "name": "직접관측 채점 및 고정",
       "level": "ok",
       "status": "✅ 정상",
-      "detail": "직접학습 41/41 · 당일갱신 41/41 (예외 0건)",
-      "latency": "7.15s"
+      "detail": "직접학습 38/41 · 당일갱신 41/41 (예외 0건)",
+      "latency": "4.24s"
     },
     {
       "step": "7. 임계값 보정",
