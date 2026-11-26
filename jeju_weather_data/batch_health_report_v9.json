@@ -1,10 +1,10 @@
 {
-  "version": "v9.5",
-  "completed_at": "2026-11-26 02:05",
+  "version": "v9.7",
+  "completed_at": "2026-11-27 00:17",
   "schedule": "매일 KST 06:42",
   "station_count": 41,
-  "total_sec": 79.41,
-  "overall": "warn",
+  "total_sec": 61.97,
+  "overall": "ok",
   "steps": [
     {
       "step": "1. 관측소 주소록",
@@ -20,23 +20,23 @@
       "level": "ok",
       "status": "✅ 정상",
       "detail": "41/41개소 적재 (전체 일괄 성공)",
-      "latency": "6.77s"
+      "latency": "6.75s"
     },
     {
       "step": "3. NASA 선행캐시",
       "name": "GEOS-FP 적응형 수집",
-      "level": "warn",
-      "status": "⚠️ 강등복구(L3)",
-      "detail": "L3 flx_Nx.20261125_00Z (11/25 09시KST기준, 5파일×12h) · 1/1격자 · 31.27s (L3 정상 수집 (31.1s))",
-      "latency": "31.27s"
+      "level": "ok",
+      "status": "✅ 정상(L3 경량)",
+      "detail": "L3 flx_Nx.20261126_00Z (11/26 10시KST기준, 5파일×12h) · 1/1격자 · 19.13s (L3 정상 수집 (18.7s))",
+      "latency": "19.13s"
     },
     {
       "step": "4. 기상청 실측",
-      "name": "전일(20261125) ASOS+AWS",
+      "name": "전일(20261126) ASOS+AWS",
       "level": "ok",
       "status": "✅ 정상",
-      "detail": "ASOS 4/4 · AWS 직접 37/37 · 보간 0 · 실패 0",
-      "latency": "34.13s"
+      "detail": "ASOS 4/4 · AWS 직접 37/37 · 보간동결 0 · 실패 0",
+      "latency": "29.14s"
     },
     {
       "step": "5. 스냅샷 아카이브",
@@ -48,18 +48,18 @@
     },
     {
       "step": "6. 가중치 학습",
-      "name": "모델 채점 및 가중치 고정",
+      "name": "직접관측 채점 및 고정",
       "level": "ok",
       "status": "✅ 정상",
-      "detail": "41/41개소 당일 갱신 완료 (예외 0건)",
-      "latency": "7.22s"
+      "detail": "직접학습 41/41 · 당일갱신 41/41 (예외 0건)",
+      "latency": "6.93s"
     },
     {
       "step": "7. 임계값 보정",
       "name": "4단계 최적 임계값 산출",
       "level": "ok",
       "status": "✅ 고정완료",
-      "detail": "기본값(표본수집중) · 표본 4/7일 · 강수 260h",
+      "detail": "기본값(표본수집중) · 표본 5/7일 · 강수 244h",
       "latency": "-"
     }
   ]
