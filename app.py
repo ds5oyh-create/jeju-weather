@@ -2466,7 +2466,6 @@ def build_dynamic_qa_context(question, res):
             lines.append(f"- 과거 예보 스냅샷: {final_reg}의 {d_str} 저장 스냅샷 없음")
 
         if stn_info and KMA_AUTH_KEY:
-            # 웹 AI 과거 조회는 ASOS 폴백·전역 회로차단 갱신을 격리해 지연 및 헬스 오염 차단
             df_obs_p, obs_msg_p, _ = fetch_kma_obs_v8(
                 stn_info, ymd, KMA_AUTH_KEY, stn_name=final_reg,
                 max_retries=1, read_to=6, hard_to=9,
@@ -2731,7 +2730,7 @@ def ask_public_weather_ai(question, res, chat_history):
     return answer_weather_rule_based(question, res, dynamic_ctx=dynamic_ctx), fallback_note, scope_label
 
 # ==========================================
-# [7-B. 전체 시스템 헬스 리포트 (배치 7단계 · 웹 4단계 · NASA 경량 정상 판정)]
+# [7-B. 전체 시스템 헬스 리포트 (배치 7단계 · 웹 4단계 · 자체 검증 스위트)]
 # ==========================================
 def save_batch_health_report(steps, total_sec, station_count):
     levels = [s.get("level", "ok") for s in steps]
@@ -2878,6 +2877,155 @@ def evaluate_full_system_health(res_web, aws_is_v2, last_ai_diag=None):
         "batch_rows": batch_rows,
         "web_rows": web_rows
     }
+
+def run_self_verification_suite(has_local_storage=False, st_ver="-"):
+    """YAML·핵심로직·로컬JSON·환경 무결성 Read-Only 자동 검증 (디스크 쓰기/외부 호출 0건)"""
+    checks = []
+
+    def _add(cat, item, ok, detail, warn_only=False):
+        lv = "ok" if ok else ("warn" if warn_only else "fail")
+        st_lbl = "✅ 통과" if ok else ("⚠️ 주의" if warn_only else "❌ 실패")
+        checks.append({"분류": cat, "검증 항목": item, "결과": st_lbl, "상세": detail, "_lv": lv})
+
+    # 1. GitHub Actions YAML 구문·필수키 검증
+    wf_files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
+    if not wf_files:
+        _add("YAML", "워크플로 파일 탐색", False, ".github/workflows/*.yml 미감지", warn_only=True)
+    else:
+        for wf in wf_files:
+            try:
+                with open(wf, "r", encoding="utf-8") as f:
+                    ytxt = f.read()
+                issues = []
+                if re.search(r'(?m)^Name\s*:', ytxt):
+                    issues.append("'Name:' 대문자 오타(소문자 'name:' 필요)")
+                if not re.search(r'(?m)^name\s*:', ytxt):
+                    issues.append("'name:' 키 누락")
+                if not re.search(r'(?m)^on\s*:', ytxt):
+                    issues.append("'on:' 트리거 누락")
+                if not re.search(r'(?m)^jobs\s*:', ytxt):
+                    issues.append("'jobs:' 섹션 누락")
+                if "\t" in ytxt:
+                    issues.append("탭(\\t) 들여쓰기 포함")
+                if "--auto-update" not in ytxt:
+                    issues.append("'--auto-update' 실행 명령 누락")
+                if "jeju_weather_data" not in ytxt:
+                    issues.append("'jeju_weather_data' 저장 경로 누락")
+                _add(
+                    "YAML", f"구문·필수키({os.path.basename(wf)})", len(issues) == 0,
+                    "필수 키·들여쓰기·실행명령 정상" if not issues else ", ".join(issues)
+                )
+            except Exception as e:
+                _add("YAML", f"파일 읽기({os.path.basename(wf)})", False, str(e)[:80])
+
+    # 2. 미채점(동결) 모델 가중치 보존 및 합계 100% 검증
+    try:
+        all_k = list(MODELS.keys())
+        om_k = [k for k in all_k if k != "nasa_geos_fp"]
+        prev_t = {om_k[0]: 29.5, om_k[-1]: 2.0, "nasa_geos_fp": 10.0}
+        rem_each = round((100.0 - 29.5 - 2.0 - 10.0) / max(1, len(om_k) - 2), 2)
+        for k in om_k[1:-1]:
+            prev_t[k] = rem_each
+        daily_t = {k: (40.0 if k == om_k[0] else (2.0 if k == om_k[-1] else 7.25)) for k in om_k}
+        al_t, up_t = update_weights_fair(prev_t, daily_t, all_k, lr=0.20)
+        nasa_ok = abs(al_t["nasa_geos_fp"] - up_t["nasa_geos_fp"]) < 1e-6
+        sum_ok = abs(sum(up_t.values()) - 100.0) <= 0.05
+        _add(
+            "로직", "미채점 모델 가중치 동결", nasa_ok and sum_ok,
+            f"NASA {al_t['nasa_geos_fp']}%→{up_t['nasa_geos_fp']}%, 총합 {sum(up_t.values()):.2f}%"
+        )
+    except Exception as e:
+        _add("로직", "미채점 모델 가중치 동결", False, str(e)[:80])
+
+    # 3. AI 날짜 파서 오인식·연말/월말 경계 검증
+    try:
+        d1 = _extract_date_from_question("비 예측 3/11개 모델인데 왜 비 유력이야?", datetime(2026, 11, 27).date())
+        d2 = _extract_date_from_question("1-2mm 비 오는데 우산 챙겨?", datetime(2026, 11, 27).date())
+        d3 = _extract_date_from_question("12월 31일 실측 어땠어?", datetime(2027, 1, 2).date())
+        d4 = _extract_date_from_question("2일 날씨 어때?", datetime(2026, 11, 27).date())
+        ok_d = (
+            (d1 is None) and (d2 is None)
+            and (d3 == datetime(2026, 12, 31).date())
+            and (d4 == datetime(2026, 12, 2).date())
+        )
+        _add("로직", "AI 날짜 파서 오인식·경계", ok_d, f"3/11개={d1}, 1-2mm={d2}, 연말={d3}, 월말={d4}")
+    except Exception as e:
+        _add("로직", "AI 날짜 파서 오인식·경계", False, str(e)[:80])
+
+    # 4. AI 관측소 매처 일반 명사 오매칭 차단 검증
+    try:
+        s1 = _match_station_in_question("내일 태풍 영향 있어?")
+        s2 = _match_station_in_question("오름 가기 좋은 날씨야?")
+        s3 = _match_station_in_question("제주도 성산 날씨 어때?")
+        ok_s = (s1 is None) and (s2 is None) and (s3 == "성산")
+        _add("로직", "AI 관측소 매처 오매칭 차단", ok_s, f"태풍={s1}, 오름={s2}, 제주도 성산={s3}")
+    except Exception as e:
+        _add("로직", "AI 관측소 매처 오매칭 차단", False, str(e)[:80])
+
+    # 5. KMA CSV(disp=1) 빈 컬럼 밀림 방지 검증
+    try:
+        row_t = _split_kma_row("202611261200,184,,3.5,12.1")
+        ok_c = (len(row_t) == 5 and row_t[2] == "" and row_t[3] == "3.5")
+        _add("로직", "KMA CSV 빈컬럼 밀림 방지", ok_c, f"컬럼수={len(row_t)}, idx3='{row_t[3] if len(row_t) > 3 else ''}'")
+    except Exception as e:
+        _add("로직", "KMA CSV 빈컬럼 밀림 방지", False, str(e)[:80])
+
+    # 6. 관측소 레지스트리 무결성 검증
+    with _LOCK:
+        stn_snapshot = dict(JEJU_STATIONS)
+    stns = [v["stn"] for v in stn_snapshot.values()]
+    dup_cnt = len(stns) - len(set(stns))
+    bad_coord = sum(1 for v in stn_snapshot.values() if not _is_jeju_coords(float(v["lat"]), float(v["lon"])))
+    has_asos4 = all(k in stn_snapshot for k in BASE_ASOS_STATIONS)
+    _add(
+        "데이터", "관측소 레지스트리 무결성", has_asos4 and dup_cnt == 0 and bad_coord == 0,
+        f"총 {len(stn_snapshot)}개소, 지점중복 {dup_cnt}건, 좌표이탈 {bad_coord}건"
+    )
+
+    # 7. 핵심 JSON 5종 파싱 및 저장 가중치 합계 검증
+    json_targets = [
+        ("가중치 장부", WEIGHT_HISTORY_FILE),
+        ("임계값 설정", OPTIMAL_THRESHOLDS_FILE),
+        ("AWS 목록 캐시", AWS_STATIONS_CACHE_FILE),
+        ("NASA 캐시", NASA_LATEST_CACHE_FILE),
+        ("배치 헬스", BATCH_HEALTH_FILE),
+    ]
+    missing, broken, bad_sum = [], [], 0
+    for lbl, fp in json_targets:
+        if not os.path.exists(fp):
+            missing.append(lbl)
+        else:
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                if fp == WEIGHT_HISTORY_FILE and isinstance(obj, dict):
+                    for reg_v in obj.values():
+                        cw = reg_v.get("cumulative_weights", {}) if isinstance(reg_v, dict) else {}
+                        if cw and abs(sum(cw.values()) - 100.0) > 0.2:
+                            bad_sum += 1
+            except Exception:
+                broken.append(lbl)
+
+    if broken or bad_sum > 0:
+        _add("데이터", "로컬 JSON 파싱·가중치 합계", False, f"손상: {broken or '없음'}, 합계오차 지역: {bad_sum}곳")
+    elif missing:
+        _add("데이터", "로컬 JSON 파싱·가중치 합계", False, f"미생성({', '.join(missing)}) — Actions 1회 실행 필요", warn_only=True)
+    else:
+        _add("데이터", "로컬 JSON 파싱·가중치 합계", True, "핵심 JSON 5종 파싱 정상 · 전 지역 가중치 합계 100%")
+
+    # 8. 런타임·시크릿·패키지 점검
+    ai_ok = bool(GEMINI_API_KEY or GROQ_API_KEY)
+    env_ok = bool(KMA_AUTH_KEY) and ai_ok and has_local_storage
+    _add(
+        "환경", "시크릿·패키지·버전", env_ok,
+        f"Streamlit {st_ver} | KMA키={'O' if KMA_AUTH_KEY else 'X'} | AI키={'O' if ai_ok else 'X'} | LocalStorage={'O' if has_local_storage else 'X'}",
+        warn_only=not env_ok
+    )
+
+    fail_cnt = sum(1 for c in checks if c["_lv"] == "fail")
+    warn_cnt = sum(1 for c in checks if c["_lv"] == "warn")
+    rows = [{k: v for k, v in c.items() if k != "_lv"} for c in checks]
+    return {"fail_cnt": fail_cnt, "warn_cnt": warn_cnt, "total_cnt": len(checks), "rows": rows}
 
 def format_status_report():
     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
@@ -3456,7 +3604,7 @@ with tab_ai:
                 st.session_state["ai_chat_history"].append({"role": "assistant", "content": full_ans})
 
 with tab_status:
-    st.markdown("#### 🖥️ 전체 시스템 진단 (일일 배치 7단계 · 웹 실시간 4단계)")
+    st.markdown("#### 🖥️ 전체 시스템 진단 (일일 배치 7단계 · 웹 실시간 4단계 · 자체 검증)")
     health = evaluate_full_system_health(
         st.session_state.get("last_result"),
         _aws_is_v2,
@@ -3488,6 +3636,61 @@ with tab_status:
 
     st.markdown("##### 2. 현재 웹 실시간 동작 4단계 (Read-Only · 15분 캐시 · KMA 0ms)")
     st.dataframe(pd.DataFrame(health["web_rows"]), width="stretch", hide_index=True)
+
+    verify_res = run_self_verification_suite(_HAS_LOCAL_STORAGE, getattr(st, "__version__", "-"))
+    v_badge = (
+        f"🟢 전 항목 통과 ({verify_res['total_cnt']}/{verify_res['total_cnt']})"
+        if verify_res["fail_cnt"] == 0 and verify_res["warn_cnt"] == 0
+        else (
+            f"🟡 주의 {verify_res['warn_cnt']}건 · 실패 0건"
+            if verify_res["fail_cnt"] == 0
+            else f"🔴 실패 {verify_res['fail_cnt']}건 · 주의 {verify_res['warn_cnt']}건"
+        )
+    )
+    st.markdown(f"##### 3. 코드·YAML·데이터 자체 검증 (Read-Only · 0ms) — {v_badge}")
+    st.dataframe(pd.DataFrame(verify_res["rows"]), width="stretch", hide_index=True)
+
+    col_ping_btn, col_ping_msg = st.columns([1.4, 3.6])
+    with col_ping_btn:
+        ping_ai_clicked = st.button("🧪 AI API 실통신 1회 점검", key="diag_ping_ai_btn", width="stretch")
+    if ping_ai_clicked:
+        res_for_ping = st.session_state.get("last_result")
+        if not res_for_ping or res_for_ping["df_future_all"].empty:
+            st.session_state["diag_ai_ping_result"] = ("warn", "먼저 [🌤️ 지역별 맞춤 예보] 탭에서 관측소 예보를 1회 로드하세요.")
+        else:
+            ok_g, wait_s = _check_global_ai_rate_limit()
+            if not ok_g:
+                st.session_state["diag_ai_ping_result"] = ("warn", f"전역 호출 제한 중 — {wait_s}초 뒤 다시 시도하세요.")
+            else:
+                with st.spinner("AI 모델 응답·모델ID 유효성 점검 중..."):
+                    t_p0 = time.time()
+                    _, eng_p, sc_p = ask_public_weather_ai("오늘 날씨 한 줄 요약", res_for_ping, [])
+                    p_sec = time.time() - t_p0
+                is_fb = "내장 규칙" in eng_p
+                st.session_state["last_ai_diag"] = {
+                    "time": datetime.now(KST).strftime("%H:%M:%S"),
+                    "engine": eng_p,
+                    "scope": sc_p,
+                    "fallback": is_fb
+                }
+                if is_fb:
+                    st.session_state["diag_ai_ping_result"] = ("fail", f"외부 AI 호출 실패 → 폴백됨 ({p_sec:.2f}s) | {eng_p}")
+                else:
+                    st.session_state["diag_ai_ping_result"] = ("ok", f"외부 AI 정상 응답 ({p_sec:.2f}s) | 엔진: {eng_p}")
+                st.rerun()
+
+    with col_ping_msg:
+        ping_state = st.session_state.get("diag_ai_ping_result")
+        if ping_state:
+            p_lv, p_txt = ping_state
+            if p_lv == "ok":
+                st.success(f"✅ {p_txt}")
+            elif p_lv == "warn":
+                st.warning(f"⚠️ {p_txt}")
+            else:
+                st.error(f"❌ {p_txt}")
+        else:
+            st.caption("버튼 클릭 시에만 AI API(Gemini/Groq) 모델 ID 유효성(404/401/200)을 1회 점검합니다.")
 
     st.caption(
         f"ℹ️ 관측소 목록·가중치·임계값·스냅샷·NASA 캐시·배치 진단표는 모두 {BATCH_SCHEDULE_LABEL} GitHub Actions 배치에서만 갱신되며, "
