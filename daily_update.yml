@@ -2,7 +2,7 @@ name: Daily Jeju Weather Weight Updater
 
 on:
   schedule:
-    - cron: '42 21 * * *'   # KST 오전 06:42 (ECMWF 12Z 전모델 완료 + 정각 큐 회피)
+    - cron: '42 21 * * *'   # KST 오전 06:42
   workflow_dispatch:
 
 permissions:
@@ -26,7 +26,7 @@ jobs:
           python-version: '3.11'
 
       - name: 3. 필수 라이브러리 설치
-        run: pip install -r requirements.txt
+        run: pip install requests pandas numpy
 
       - name: 4. 제주 전 관측소 스냅샷·가중치·임계값·NASA 배치 갱신
         env:
@@ -38,6 +38,7 @@ jobs:
           PYTHONUNBUFFERED=1 python -u app.py --auto-update
 
       - name: 5. 갱신된 장부·스냅샷·임계값·캐시 안전 저장
+        if: always()
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "JejuWeatherBot"
