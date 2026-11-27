@@ -131,8 +131,7 @@ BATCH_HEALTH_FILE = os.path.join(SAVE_DIR, "batch_health_report_v9.json")
 # ==========================================
 def _create_runtime_state():
     return {
-        "lock": threading.Lock(),
-        "kma_rate_lock": threading.Lock(),
+        "lock": threading.RLock(),
         "kma_last_req_ts": 0.0,
         "kma_conn_fails": 0,
         "kma_down_until": 0.0,
@@ -1772,11 +1771,12 @@ def prefetch_kma_asos_batch(date_str, auth_key):
         if attempt == 0:
             time.sleep(0.5)
 
-    sec = time.time() - t0
-    fail_msg = f"기상청 회로차단({last_reason})" if _is_kma_down() else f"ASOS 일괄실패({last_reason})"
+sec = time.time() - t0
+    kma_down = _is_kma_down()
+    fail_msg = f"기상청 회로차단({last_reason})" if kma_down else f"ASOS 일괄실패({last_reason})"
     with _LOCK:
         SYSTEM_HEALTH["api_status"]["KMA ASOS (종관기상관측)"] = {
-            "status": "⛔ 회로차단" if _is_kma_down() else "❌ 일괄실패",
+            "status": "⛔ 회로차단" if kma_down else "❌ 일괄실패",
             "code": "ERR", "latency_ms": int(sec * 1000), "errors": 1, "msg": fail_msg
         }
     return sec, 0, last_reason
@@ -1925,6 +1925,11 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None
     if not _is_kma_down():
         with _LOCK:
             any_asos = any((aid, date_str) in _OBS_DIRECT_CACHE for aid in ASOS_HUBS.keys())
+        if deadline_ts is None and not _is_kma_down():
+            with _LOCK:
+            any_asos = any((aid, date_str) in _OBS_DIRECT_CACHE for aid in ASOS_HUBS.keys())
+        if not any_asos:
+            prefetch_kma_asos_batch(date_str, auth_key)
         if not any_asos:
             prefetch_kma_asos_batch(date_str, auth_key)
 
