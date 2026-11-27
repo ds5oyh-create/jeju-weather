@@ -1924,10 +1924,10 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None
     if not _is_kma_down():
         with _LOCK:
             any_asos = any((aid, date_str) in _OBS_DIRECT_CACHE for aid in ASOS_HUBS.keys())
-        if deadline_ts is None and not _is_kma_down():
-            with _LOCK:
+    if deadline_ts is None and not _is_kma_down():
+       with _LOCK:
             any_asos = any((aid, date_str) in _OBS_DIRECT_CACHE for aid in ASOS_HUBS.keys())
-        if not any_asos:
+       if not any_asos:
             prefetch_kma_asos_batch(date_str, auth_key)
         if not any_asos:
             prefetch_kma_asos_batch(date_str, auth_key)
