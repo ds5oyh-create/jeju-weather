@@ -1771,7 +1771,7 @@ def prefetch_kma_asos_batch(date_str, auth_key):
         if attempt == 0:
             time.sleep(0.5)
 
-sec = time.time() - t0
+    sec = time.time() - t0
     kma_down = _is_kma_down()
     fail_msg = f"기상청 회로차단({last_reason})" if kma_down else f"ASOS 일괄실패({last_reason})"
     with _LOCK:
@@ -1780,11 +1780,6 @@ sec = time.time() - t0
             "code": "ERR", "latency_ms": int(sec * 1000), "errors": 1, "msg": fail_msg
         }
     return sec, 0, last_reason
-            "status": "⛔ 회로차단" if kma_down else "❌ 일괄실패",
-            "code": "ERR", "latency_ms": int(sec * 1000), "errors": 1, "msg": fail_msg
-        }
-    return sec, 0, last_reason
-
 def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None, max_retries=2, read_to=12, hard_to=20):
     """KMA 실측 수집 (AWS 음수 결측값 -99.9/-9.0을 0.0이 아닌 NaN으로 엄격 격리)"""
     if not auth_key:
