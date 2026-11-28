@@ -1098,7 +1098,7 @@ def _build_nasa_df_from_cell(times_iso, cell_dict, step_hours=6):
         s_p_raw = df_fc["precipitation_nasa_geos_fp"].clip(lower=0.0)
         s_p_fwd = s_p_raw.ffill(limit=1)
         s_p_bwd = s_p_raw.bfill(limit=1)
-        df_fc["precipitation_nasa_geos_fp"] = s_p_fwd.combine_first(s_p_bwd) = s_p_raw.interpolate(method="nearest", limit=1, limit_area="inside")
+        df_fc["precipitation_nasa_geos_fp"] = s_p_fwd.combine_first(s_p_bwd)
     df_fc["precipitation_probability_nasa_geos_fp"] = estimate_prob_from_rain(df_fc["precipitation_nasa_geos_fp"])
     return df_fc, has_rain
 
