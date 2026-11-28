@@ -127,11 +127,12 @@ NASA_DIAG_FILE = os.path.join(SAVE_DIR, "nasa_diagnostics_v9.json")
 BATCH_HEALTH_FILE = os.path.join(SAVE_DIR, "batch_health_report_v9.json")
 
 # ==========================================
-# [0-A. Streamlit 캐시 리소스 영속 상태 (rerun 초기화 방지 · CLI 무의존)]
+# [0-A. Streamlit 캐시 리소스 영속 상태 (RLock · rerun 초기화 방지 · CLI 무의존)]
 # ==========================================
 def _create_runtime_state():
     return {
         "lock": threading.RLock(),
+        "kma_rate_lock": threading.Lock(),
         "kma_last_req_ts": 0.0,
         "kma_conn_fails": 0,
         "kma_down_until": 0.0,
@@ -142,6 +143,7 @@ def _create_runtime_state():
         "obs_direct_cache": {},
         "obs_fallback_cache": {},
         "ai_global_calls": [],
+        "ai_hist_cache": {},
         "system_health": {
             "storage_mode": f"✅ {APP_VERSION} Simplex투영 · KMA결측격리 · Brier분리 · OOS보정 · 웹Read-Only({BATCH_SCHEDULE_LABEL})",
             "storage_path": SAVE_DIR,
@@ -356,8 +358,6 @@ def project_bounded_simplex(raw_map, floor_v, cap_v, target_sum=100.0):
     """
     L2 최근접 가산형 단체 투영:
       min ||w - v||^2  s.t.  sum(w) = target_sum,  eff_floor <= w_i <= eff_cap
-    - 소수 모델(예: 4개 이하)에서 cap*n <= 100으로 전 모델 동률(25%×4)이 되는 병리 현상을 방지.
-    - 상·하한 위반 및 반올림 오차(합계 100.00%)를 엄격하게 보정.
     """
     if not raw_map:
         return {}
@@ -369,7 +369,6 @@ def project_bounded_simplex(raw_map, floor_v, cap_v, target_sum=100.0):
     eq_share = float(target_sum) / n
     eff_floor = min(float(floor_v), eq_share)
     eff_cap = float(cap_v)
-    # 모델 수가 적어 n * cap <= target_sum이면 전 모델이 cap에 묶여 순위가 사라지므로 상한을 안전 완화
     if eff_cap * n <= float(target_sum) + 1e-6:
         eff_cap = min(float(target_sum) - (n - 1) * eff_floor, max(eff_cap, eq_share * 1.35))
 
@@ -445,7 +444,6 @@ def _optimize_thresholds_from_records(records, mode_label, min_wet):
         out.update({"days": days, "hours": hours, "wet_hours": wet_hours, "val_days": 0})
         return out
 
-    # 시간순 Train / Out-of-Sample Validation 분할
     n_val_days = max(2, int(round(days * 0.30)))
     if days - n_val_days < 4:
         n_val_days = max(1, days - 4)
@@ -470,7 +468,6 @@ def _optimize_thresholds_from_records(records, mode_label, min_wet):
         })
         return out
 
-    # Train 구간에서만 임계값 후보 탐색
     best_pr, best_pr_score = 50.0, -1.0
     for cand in [35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0]:
         pred = (tr_probs >= cand) | (tr_rains >= 0.5)
@@ -508,7 +505,6 @@ def _optimize_thresholds_from_records(records, mode_label, min_wet):
     final_yl = round(float(np.clip(best_yl * 0.7 + 0.60 * 0.3, 0.45, 0.70)), 2)
     final_yw = round(float(np.clip(best_yw * 0.7 + 0.30 * 0.3, 0.20, min(0.40, final_yl - 0.15))), 2)
 
-    # Out-of-Sample Validation 구간에서만 성능 채점 및 기본값 대비 회귀 검증
     tuned_val_pred = (va_probs >= final_pr) | (va_rains >= 0.5)
     base_val_pred = (va_probs >= 50.0) | (va_rains >= 0.5)
     _, f1_tuned, pod_tuned, far_tuned = _calc_binary_skill(tuned_val_pred, va_wet, beta=1.2)
@@ -670,7 +666,6 @@ def save_forecast_snapshot(region_name, today_date, now_kst, df_mod, active_mode
     snap_db = _load_json_safe(snap_path, {}, strict_on_corrupt=True)
     ps_map = prob_source_map or {}
 
-    # best_match 비상키가 스냅샷에 섞이지 않도록 공식 MODELS만 허용
     valid_models = [mc for mc in active_models.keys() if mc in MODELS]
     if not valid_models:
         return False
@@ -866,10 +861,6 @@ def prefetch_open_meteo_batch(station_names, om_keys, past_days, now_kst, chunk_
     return time.time() - t0, cached_cnt, ("전체 일괄 성공" if not errors else " / ".join(errors))
 
 def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst, allow_emergency_best_match=True):
-    """
-    best_match(models=None) 폴백은 ECMWF로 오인 저장하지 않고 EMERGENCY_BEST_MATCH_KEY로 격리.
-    배치 학습 모드에서는 allow_emergency_best_match=False로 학습 오염을 원천 차단.
-    """
     cache_key = (round(lat, 4), round(lon, 4), past_days)
     now_ts = time.time()
     with _LOCK:
@@ -922,7 +913,6 @@ def fetch_open_meteo_resilient(lat, lon, om_keys, past_days, now_kst, allow_emer
         if parts:
             df_all = pd.concat(parts, axis=1)
 
-    # 개별 모델 전면 실패 시 웹 표시 비상용으로만 best_match 격리 사용 (ECMWF 오인 차단)
     if df_all.empty and allow_emergency_best_match:
         d_bm = _call(None)
         if d_bm:
@@ -996,7 +986,7 @@ def _parse_das_time_bounds(das_text):
     return t_min, t_max, n_hours
 
 def _resolve_nasa_vars_from_das(das_text, requested_vars):
-    """DAS 메타데이터에서 실제 존재하는 변수명 검증·매핑 (변수명 불일치 방어)"""
+    """DAS 메타데이터에서 실제 존재하는 변수명 검증·매핑"""
     avail = set(re.findall(r'^\s{2,4}([a-zA-Z0-9_]+)\s*\{', das_text, flags=re.MULTILINE))
     if not avail:
         return list(requested_vars), {"temp": "tlml", "wind": "speed", "rain": "prectot"}
@@ -1070,11 +1060,7 @@ def _nasa_grid_cell_for_coords(lat, lon):
     return lat_idx, lon_idx
 
 def _build_nasa_df_from_cell(times_iso, cell_dict, step_hours=6):
-    """
-    기온·풍속만 선형 보간하고, 강수량(prectot)은 선형 보간을 전면 금지.
-    - 6h/12h 간격 강수 샘플을 선형 보간하면 미세강수 1건이 11~23시간으로 번지는 문제를 방지.
-    - 실제 샘플 시각 기준 ±1시간(nearest, limit=1)만 제한 매핑하고 원거리 빈 시간은 NaN 유지.
-    """
+    """기온·풍속만 선형 보간하고 강수량(prectot)은 선형 보간 금지(±1h 최근접만 허용)"""
     if not times_iso or not cell_dict:
         return pd.DataFrame(), False
     t_arr = cell_dict.get("t", [])
@@ -1105,16 +1091,12 @@ def _build_nasa_df_from_cell(times_iso, cell_dict, step_hours=6):
     full_idx = pd.date_range(df_fc.index.min(), df_fc.index.max(), freq="1h")
     df_fc = df_fc.reindex(full_idx)
 
-    # 연속 변수(기온·풍속)만 선형 보간
     df_fc["temperature_2m_nasa_geos_fp"] = df_fc["temperature_2m_nasa_geos_fp"].interpolate(method="linear", limit=interp_lim)
     if has_wind:
         df_fc["wind_speed_10m_nasa_geos_fp"] = df_fc["wind_speed_10m_nasa_geos_fp"].interpolate(method="linear", limit=interp_lim).clip(lower=0.0)
-
-    # 강수량은 선형 보간 금지: 실측 샘플 시각 ±1h 이내만 최근접 매핑 (장시간 번짐 원천 차단)
     if has_rain:
         s_p_raw = df_fc["precipitation_nasa_geos_fp"].clip(lower=0.0)
-        s_p_near = s_p_raw.interpolate(method="nearest", limit=1, limit_area="inside")
-        df_fc["precipitation_nasa_geos_fp"] = s_p_near
+        df_fc["precipitation_nasa_geos_fp"] = s_p_raw.interpolate(method="nearest", limit=1, limit_area="inside")
     df_fc["precipitation_probability_nasa_geos_fp"] = estimate_prob_from_rain(df_fc["precipitation_nasa_geos_fp"])
     return df_fc, has_rain
 
@@ -1245,10 +1227,11 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
             "detail": das_err, "action": diag["last_action"]
         })
         _save_nasa_diag(diag)
-        SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
-            "status": "⚠️ 미수신", "code": das_err_type, "latency_ms": int(sec * 1000),
-            "errors": 1, "msg": f"DAS 실패: {das_err} (연속 {diag['consecutive_full_fails']}회)"
-        }
+        with _LOCK:
+            SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
+                "status": "⚠️ 미수신", "code": das_err_type, "latency_ms": int(sec * 1000),
+                "errors": 1, "msg": f"DAS 실패: {das_err} (연속 {diag['consecutive_full_fails']}회)"
+            }
         return False, sec, f"미수신({das_err})", 0, 0
 
     label, ds_url, t_min_utc, n_hours, das_text = selected
@@ -1315,7 +1298,6 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
             spd_map = _parse_opendap_ascii_3d(txt_data, role_map["wind"]) if role_map["wind"] else {}
             prc_map = _parse_opendap_ascii_3d(txt_data, role_map["rain"]) if role_map["rain"] else {}
 
-            # tavg1 중심시각(HH:30)을 +30분 정시 정렬해 Open-Meteo 직전 1시간 강수 시각과 일치시킴
             st_kst_raw = (t_min_utc + timedelta(hours=9)).replace(tzinfo=None)
             if st_kst_raw.minute >= 30:
                 st_kst_base = (st_kst_raw + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
@@ -1394,10 +1376,11 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
                 })
                 _save_nasa_diag(diag)
                 note = f"{payload['run_label']} · {valid_cells}/{n_y*n_x}격자 · {sec:.2f}s ({action_txt})"
-                SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
-                    "status": f"✅ 정상(L{lvl} 캐시저장)", "code": "200 OK", "latency_ms": int(sec * 1000),
-                    "errors": 0, "msg": note
-                }
+                with _LOCK:
+                    SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
+                        "status": f"✅ 정상(L{lvl} 캐시저장)", "code": "200 OK", "latency_ms": int(sec * 1000),
+                        "errors": 0, "msg": note
+                    }
                 return True, sec, note, lvl, valid_cells
 
             last_err_type = "ParseEmpty"
@@ -1458,10 +1441,11 @@ def prefetch_nasa_jeju_grid_cache_adaptive():
         diag["last_action"] = f"일시 통신/HTTP 오류({last_err_type}) → 기존 권장단계 L{start_level} 유지"
 
     _save_nasa_diag(diag)
-    SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
-        "status": "⚠️ 미수신(전단계실패)", "code": last_err_type, "latency_ms": int(sec * 1000),
-        "errors": 1, "msg": f"{last_err} | {diag['last_action']}"
-    }
+    with _LOCK:
+        SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
+            "status": "⚠️ 미수신(전단계실패)", "code": last_err_type, "latency_ms": int(sec * 1000),
+            "errors": 1, "msg": f"{last_err} | {diag['last_action']}"
+        }
     return False, sec, f"미수신({last_err})", 0, 0
 
 def fetch_nasa_geos_cache_only(lat, lon):
@@ -1477,33 +1461,35 @@ def fetch_nasa_geos_cache_only(lat, lon):
     df_disk, disk_note, disk_has_rain, disk_fresh, age_h, prof_lvl = load_nasa_from_disk_cache(lat, lon)
     if not df_disk.empty and disk_fresh:
         lvl_tag = f"L{prof_lvl}" if prof_lvl else "CACHE"
-        SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
-            "status": f"✅ 캐시로드(0ms·{lvl_tag})", "code": "CACHE", "latency_ms": 0,
-            "errors": 0, "msg": disk_note
-        }
         with _LOCK:
+            SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
+                "status": f"✅ 캐시로드(0ms·{lvl_tag})", "code": "CACHE", "latency_ms": 0,
+                "errors": 0, "msg": disk_note
+            }
             _NASA_MEM_CACHE[ck] = {"ts": now_ts, "df": df_disk, "note": disk_note, "has_rain": disk_has_rain, "prof_lvl": prof_lvl}
         return df_disk, 0.0, disk_note, disk_has_rain, prof_lvl, "FRESH"
 
     if not df_disk.empty and not disk_fresh:
         stale_msg = f"24시간 경과 만료({age_h:.1f}h전 수집) → 구형 캐시 자동 제외(10대 운영)"
-        SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
-            "status": "⚠️ 만료제외(24h초과)", "code": "STALE_SKIPPED", "latency_ms": 0,
-            "errors": 0, "msg": stale_msg
-        }
+        with _LOCK:
+            SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
+                "status": "⚠️ 만료제외(24h초과)", "code": "STALE_SKIPPED", "latency_ms": 0,
+                "errors": 0, "msg": stale_msg
+            }
         return pd.DataFrame(), 0.0, stale_msg, False, prof_lvl, "STALE"
 
     diag = _load_nasa_diag()
     diag_hint = f"직전 배치: {diag.get('last_status', '미실행')}"
     miss_msg = f"배치캐시 미생성 → 10대 자동 운영 ({diag_hint})"
-    SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
-        "status": "⏸️ 캐시대기(10대운영)", "code": "NO_CACHE", "latency_ms": 0,
-        "errors": 0, "msg": miss_msg
-    }
+    with _LOCK:
+        SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
+            "status": "⏸️ 캐시대기(10대운영)", "code": "NO_CACHE", "latency_ms": 0,
+            "errors": 0, "msg": miss_msg
+        }
     return pd.DataFrame(), 0.0, miss_msg, False, 0, "MISSING"
 
 # ==========================================
-# [4. 기상청 수집 (센서결측 NaN 격리 · 겨울철 ASOS 3시간 강수 집계 방어 · KMA 6.3 다중페이지)]
+# [4. 기상청 수집 (데드락 해소 · 센서결측 NaN 격리 · 겨울철 ASOS 3시간 강수 방어)]
 # ==========================================
 def _is_conn_error(exc):
     return isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError))
@@ -1519,13 +1505,7 @@ def _format_req_error(exc, read_sec):
     return f"{type(exc).__name__}:{str(exc)[:25]}"
 
 def _sanitize_asos_obs_df(raw_recs):
-    """
-    ASOS kma_sfctm3.php 관측값 정제:
-    - 풍속(ws): 음수(-9.0/-99.0 등) 결측을 0.0이 아닌 NaN으로 격리.
-    - 강수(rn): 센서 결측(<= -90)은 NaN, 무강수 미보고(-9.0)는 기본 0.0 처리하되,
-      겨울철(11~3월) 3시간 간격 강수 보고(00/03/06/09/12/15/18/21시에만 양수, 중간시각 전부 -9.0)가
-      감지되면 3시간 합산 왜곡을 막기 위해 해당일의 모호한 시간 강수량을 NaN 격리.
-    """
+    """ASOS 음수 결측(-99.x/-9.0) NaN 격리 및 겨울철 3시간 묶음 강수 방어"""
     if not raw_recs:
         return pd.DataFrame()
     df = pd.DataFrame(raw_recs).drop_duplicates('time').set_index('time').sort_index()
@@ -1533,7 +1513,6 @@ def _sanitize_asos_obs_df(raw_recs):
     rn_clean = pd.Series(np.nan, index=df.index, dtype=float)
     rn_clean[rn_raw >= 0.0] = rn_raw[rn_raw >= 0.0]
 
-    # ASOS -9.0 (무강수 미보고)와 -99.x (센서 결측) 구분
     no_rep_mask = (rn_raw < 0.0) & (rn_raw > -50.0)
     is_winter = bool(df.index[0].month in (11, 12, 1, 2, 3))
     pos_times = df.index[rn_raw > 0.0]
@@ -1546,7 +1525,6 @@ def _sanitize_asos_obs_df(raw_recs):
             winter_3h_bundled = True
 
     if winter_3h_bundled:
-        # 3시간 묶음 보고일: 양수 보고 직전 2시간과 묶음 시각 자체의 1시간 강수량은 분리 불가 → NaN 격리
         ambiguous = set()
         for ts in pos_times:
             ambiguous.add(ts)
@@ -1589,11 +1567,12 @@ def load_cached_jeju_aws_stations():
     if aws_cnt > 0:
         upd = cache_data.get("updated_at", "-")
         tag = "공식v2캐시" if is_v2 else "구형v1캐시(배치갱신대기)"
-        SYSTEM_HEALTH["api_status"]["KMA 6.3 (AWS 지점일람표)"] = {
-            "status": "✅ 캐시로드" if is_v2 else "⚠️ 갱신대기",
-            "code": "CACHE", "latency_ms": 0, "errors": 0,
-            "msg": f"{tag} AWS {aws_cnt}개소 (갱신 {upd})"
-        }
+        with _LOCK:
+            SYSTEM_HEALTH["api_status"]["KMA 6.3 (AWS 지점일람표)"] = {
+                "status": "✅ 캐시로드" if is_v2 else "⚠️ 갱신대기",
+                "code": "CACHE", "latency_ms": 0, "errors": 0,
+                "msg": f"{tag} AWS {aws_cnt}개소 (갱신 {upd})"
+            }
     return aws_cnt, cache_data.get("updated_at", ""), is_v2
 
 def auto_discover_jeju_aws_stations(auth_key, allow_network=False, force=False):
@@ -1672,10 +1651,11 @@ def auto_discover_jeju_aws_stations(auth_key, allow_network=False, force=False):
                     "updated_at": now_str,
                     "stations": extra_map
                 }, compact=False)
-                SYSTEM_HEALTH["api_status"]["KMA 6.3 (AWS 지점일람표)"] = {
-                    "status": "✅ 정상(공식v2)", "code": "200 OK", "latency_ms": int((time.time()-t0)*1000),
-                    "errors": 0, "msg": f"{yr}년 공식 제주 AWS {len(extra_map)}개소 동기화 ({page_no}페이지)"
-                }
+                with _LOCK:
+                    SYSTEM_HEALTH["api_status"]["KMA 6.3 (AWS 지점일람표)"] = {
+                        "status": "✅ 정상(공식v2)", "code": "200 OK", "latency_ms": int((time.time()-t0)*1000),
+                        "errors": 0, "msg": f"{yr}년 공식 제주 AWS {len(extra_map)}개소 동기화 ({page_no}페이지)"
+                    }
                 return len(extra_map)
         except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as e:
             _record_kma_conn_failure(_format_req_error(e, 8))
@@ -1780,6 +1760,7 @@ def prefetch_kma_asos_batch(date_str, auth_key):
             "code": "ERR", "latency_ms": int(sec * 1000), "errors": 1, "msg": fail_msg
         }
     return sec, 0, last_reason
+
 def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None, max_retries=2, read_to=12, hard_to=20):
     """KMA 실측 수집 (AWS 음수 결측값 -99.9/-9.0을 0.0이 아닌 NaN으로 엄격 격리)"""
     if not auth_key:
@@ -1895,7 +1876,6 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None
                         ot = pd.to_datetime(p[0], format='%Y%m%d%H%M', errors='coerce')
                         ws10, ta, rn60 = pd.to_numeric(p[7], errors='coerce'), pd.to_numeric(p[8], errors='coerce'), pd.to_numeric(p[11], errors='coerce')
                         if pd.notnull(ot) and pd.notnull(ta) and -40.0 < float(ta) < 50.0:
-                            # AWS 결측 음수(-99.9, -99.0, -9.0)는 절대 0.0으로 덮지 않고 NaN 격리
                             recs.append({
                                 'time': ot,
                                 'obs_temp': float(ta),
@@ -1921,14 +1901,9 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None
         if attempt + 1 < max_retries:
             time.sleep(0.6)
 
-    if not _is_kma_down():
+    if deadline_ts is None and not _is_kma_down():
         with _LOCK:
             any_asos = any((aid, date_str) in _OBS_DIRECT_CACHE for aid in ASOS_HUBS.keys())
-    if deadline_ts is None and not _is_kma_down():
-       with _LOCK:
-            any_asos = any((aid, date_str) in _OBS_DIRECT_CACHE for aid in ASOS_HUBS.keys())
-       if not any_asos:
-            prefetch_kma_asos_batch(date_str, auth_key)
         if not any_asos:
             prefetch_kma_asos_batch(date_str, auth_key)
 
@@ -1982,14 +1957,14 @@ def prefetch_kma_obs_batch(station_names, date_str, auth_key, max_workers=2, max
 
     return time.time() - t0, asos_sec, asos_ok, aws_dir, aws_int, fail_logs, _is_kma_down()
 
+# ===== [1/2부 끝 — 이 바로 아래에 2/2부를 이어 붙여넣으세요] =====
 # ==========================================
 # [5. v9.8 공정 4중 채점 (동일 평가구간 교집합 · Brier 그룹분리 · Simplex 투영)]
 # ==========================================
 def evaluate_4way_fair(df_eval, candidate_models, df_obs, prob_source_map=None):
     """
     1) 동일 평가구간 교집합(Common Window): 모든 채점 모델이 동일한 시각 집합에서 경쟁.
-    2) Brier Score 분리 채점: 자체확률 모델군 vs 강수환산 모델군을 분리 정규화하고
-       두 그룹의 평균 확률 점수를 동일 기준(100/N)으로 맞춰 교차 왜곡 차단.
+    2) Brier Score 분리 채점: 자체확률 모델군 vs 강수환산 모델군 분리 정규화.
     3) 가산형 단체 투영(project_bounded_simplex)으로 일일 점수 상·하한 엄격 준수.
     """
     metrics = _empty_metrics_dict()
@@ -2003,7 +1978,6 @@ def evaluate_4way_fair(df_eval, candidate_models, df_obs, prob_source_map=None):
     if len(obs_core) < MIN_EVAL_HOURS:
         return {}, metrics
 
-    # 각 모델별 유효 시각 집합 추출
     valid_idx_map = {}
     for m_code in candidate_models:
         if m_code not in MODELS:
@@ -2017,7 +1991,6 @@ def evaluate_4way_fair(df_eval, candidate_models, df_obs, prob_source_map=None):
     if not valid_idx_map:
         return {}, metrics
 
-    # 동일 평가창(Common Window) 산출: 다수 모델이 공유하는 최대 교집합 우선
     by_len = sorted(valid_idx_map.items(), key=lambda x: len(x[1]), reverse=True)
     common_idx = by_len[0][1]
     aligned_keys = [by_len[0][0]]
@@ -2050,7 +2023,6 @@ def evaluate_4way_fair(df_eval, candidate_models, df_obs, prob_source_map=None):
 
         p_mode = ps_map.get(m_code, "강수환산" if m_code == "nasa_geos_fp" else "자체확률")
         if p_mode not in ("자체확률", "강수환산"):
-            # 구형 스냅샷(ps 미기록): 0/40/65/82/92 고정 계단값 여부로 자동 판별
             uniq_p = set(round(float(x), 1) for x in df_pair[pr_c].dropna().unique())
             p_mode = "강수환산" if uniq_p.issubset({0.0, 15.0, 40.0, 65.0, 82.0, 92.0}) else "자체확률"
 
@@ -2067,7 +2039,6 @@ def evaluate_4way_fair(df_eval, candidate_models, df_obs, prob_source_map=None):
     if not scored_keys:
         return {}, metrics
 
-    # 풍속 미수신 모델(L2/L3 등)은 중앙값으로 중립 처리
     w_valid_vals = [metrics[k]['wind_mae'] for k in scored_keys if metrics[k].get('has_wind')]
     med_w_mae = round(float(np.median(w_valid_vals)), 2) if w_valid_vals else 1.5
     for k in scored_keys:
@@ -2075,7 +2046,6 @@ def evaluate_4way_fair(df_eval, candidate_models, df_obs, prob_source_map=None):
             metrics[k]['wind_mae'] = med_w_mae
             metrics[k]['wind_bias'] = 0.0
 
-    # Brier Score 그룹 분리 채점 (자체확률군 vs 강수환산군 혼합 왜곡 제거 + 스무딩)
     n_scored = len(scored_keys)
     native_keys = [k for k in scored_keys if metrics[k].get('prob_mode') == "자체확률"]
     derived_keys = [k for k in scored_keys if k not in native_keys]
@@ -2215,7 +2185,7 @@ def _safe_peak_row(df_slice):
     return df_slice.iloc[0]
 
 def _build_hourly_verification_records(df_eval, df_obs_y, eval_candidates, cum_weights):
-    """전일 시간별 예보 vs 기상청 실측 검증 이력 생성 (일별 누락 없이 시간별 조회 지원)"""
+    """전일 시간별 예보 vs 기상청 실측 검증 이력 생성"""
     if df_eval.empty or df_obs_y.empty:
         return []
     df_e = df_eval[~df_eval.index.duplicated(keep='first')]
@@ -2262,7 +2232,8 @@ def run_station_pipeline(matched_key, recompute_global_cal=True, progress_cb=Non
     yesterday_date = today_date - timedelta(days=1)
     yesterday_str = yesterday_date.strftime("%Y%m%d")
     yesterday_iso = yesterday_date.strftime("%Y-%m-%d")
-    SYSTEM_HEALTH["last_check_time"] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+    with _LOCK:
+        SYSTEM_HEALTH["last_check_time"] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
     run_error_count = 0
 
     history = _load_json_safe(WEIGHT_HISTORY_FILE, {}, strict_on_corrupt=is_batch_mode)
@@ -2281,7 +2252,6 @@ def run_station_pipeline(matched_key, recompute_global_cal=True, progress_cb=Non
     if df_mod.empty:
         run_error_count += 1
 
-    # 10x 지연 표기 오류 수정: om_ms / 1000.0 (기존 /10000.0 오차 제거)
     om_lat_s = round(om_ms / 1000.0, 2)
     for idx, (mc, prob_info) in enumerate(loaded_om.items(), 1):
         if mc == EMERGENCY_BEST_MATCH_KEY:
@@ -2291,15 +2261,17 @@ def run_station_pipeline(matched_key, recompute_global_cal=True, progress_cb=Non
             continue
         mm = MODELS[mc]
         active_models[mc], model_max_hours[mc], prob_source_map[mc] = mm["name"], mh_om[mc], prob_info
-        SYSTEM_HEALTH["model_registry"][mc] = {"status": "✅ 사용중", "max_hours": mh_om[mc], "latency_s": om_lat_s, "note": f"정상 ({prob_info})"}
+        with _LOCK:
+            SYSTEM_HEALTH["model_registry"][mc] = {"status": "✅ 사용중", "max_hours": mh_om[mc], "latency_s": om_lat_s, "note": f"정상 ({prob_info})"}
         if log_cb:
             log_cb(f"✔ [{idx:02d}/10] {mm['name']} ({mm['res']}) 로드 ({mh_om[mc]}h, {prob_info})")
 
-    SYSTEM_HEALTH["api_status"]["Open-Meteo (10대 통합 NWP)"] = {
-        "status": om_status, "code": "200 OK" if not df_mod.empty else "ERR",
-        "latency_ms": om_ms, "errors": 0 if not df_mod.empty else 1,
-        "msg": f"{om_msg}{' (15분캐시)' if om_cached else ''}"
-    }
+    with _LOCK:
+        SYSTEM_HEALTH["api_status"]["Open-Meteo (10대 통합 NWP)"] = {
+            "status": om_status, "code": "200 OK" if not df_mod.empty else "ERR",
+            "latency_ms": om_ms, "errors": 0 if not df_mod.empty else 1,
+            "msg": f"{om_msg}{' (15분캐시)' if om_cached else ''}"
+        }
 
     if progress_cb:
         progress_cb(55, "🛰️ [2/3] NASA 배치캐시(0ms) 및 배치 고정 가중치·임계값 적용 중...")
@@ -2316,18 +2288,21 @@ def run_station_pipeline(matched_key, recompute_global_cal=True, progress_cb=Non
             model_max_hours["nasa_geos_fp"] = nasa_fh
             prob_source_map["nasa_geos_fp"] = "강수환산" if nasa_has_rain else "강수미수신(NaN)"
             nasa_loaded = True
-            SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": f"✅ 사용중(L{nasa_level})" if nasa_has_rain else "⚠️ 강수누락", "max_hours": nasa_fh, "latency_s": 0.0, "note": nasa_note}
+            with _LOCK:
+                SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": f"✅ 사용중(L{nasa_level})" if nasa_has_rain else "⚠️ 강수누락", "max_hours": nasa_fh, "latency_s": 0.0, "note": nasa_note}
             if log_cb:
                 log_cb(f"✔ [11/11] 미국(NASA GEOS) L{nasa_level} 배치캐시 기본 합산 ({nasa_fh}h)")
         else:
             nasa_status_code = "SHORT_HORIZON"
             nasa_note = f"유효미래시간 부족({nasa_fh}h < 12h) → 10대 자동 운영"
-            SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": "⚠️ 시간부족제외", "max_hours": nasa_fh, "latency_s": 0.0, "note": nasa_note}
-            SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
-                "status": "⚠️ 시간부족제외", "code": "SHORT_HORIZON", "latency_ms": 0, "errors": 0, "msg": nasa_note
-            }
+            with _LOCK:
+                SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": "⚠️ 시간부족제외", "max_hours": nasa_fh, "latency_s": 0.0, "note": nasa_note}
+                SYSTEM_HEALTH["api_status"]["NASA GEOS-FP (기본통합캐시)"] = {
+                    "status": "⚠️ 시간부족제외", "code": "SHORT_HORIZON", "latency_ms": 0, "errors": 0, "msg": nasa_note
+                }
     else:
-        SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": f"⏸️ 제외({nasa_status_code})", "max_hours": 0, "latency_s": 0.0, "note": nasa_note}
+        with _LOCK:
+            SYSTEM_HEALTH["model_registry"]["nasa_geos_fp"] = {"status": f"⏸️ 제외({nasa_status_code})", "max_hours": 0, "latency_s": 0.0, "note": nasa_note}
         if log_cb:
             log_cb(f"⏸️ [11/11] 미국(NASA GEOS) {nasa_note}")
 
@@ -2502,7 +2477,6 @@ def run_station_pipeline(matched_key, recompute_global_cal=True, progress_cb=Non
         cum_weights = history[matched_key]["cumulative_weights"]
         prev_weights = history[matched_key]["prev_weights"]
 
-        # 전일 시간별 검증 이력 & 일별 모델 성적 이력 저장 (최근 14일 보관 · 당일 재실행 시에도 누락 방지)
         h_recs = _build_hourly_verification_records(df_eval, df_obs_y, eval_candidates, cum_weights)
         if h_recs:
             h_hist = history[matched_key].setdefault("hourly_history", {})
@@ -2729,7 +2703,6 @@ def build_dynamic_qa_context(question, res):
         else:
             lines.append(f"- 과거 예보 스냅샷: {final_reg}의 {d_str} 저장 스냅샷 없음")
 
-        # 장부에 저장된 시간별 검증 이력이 있으면 KMA API 호출 생략
         hist_db_local = _load_json_safe(WEIGHT_HISTORY_FILE, {})
         saved_h = hist_db_local.get(final_reg, {}).get("hourly_history", {}).get(d_str, [])
         if saved_h:
@@ -3185,7 +3158,8 @@ def format_status_report():
     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     sec_kma = "🔒연동됨" if KMA_AUTH_KEY else "⚠️미설정"
     kma_cb_txt = f"⛔ 차단중({_get_kma_down_reason()})" if _is_kma_down() else "✅ 정상대기"
-    api_lines = [f"• {k}: {v['status']} ({v['latency_ms']}ms) - {v['msg']}" for k, v in SYSTEM_HEALTH["api_status"].items()]
+    with _LOCK:
+        api_lines = [f"• {k}: {v['status']} ({v['latency_ms']}ms) - {v['msg']}" for k, v in SYSTEM_HEALTH["api_status"].items()]
     snaps = list_saved_snapshots()
     snap_txt = ", ".join(snaps) if snaps else "아직 저장된 스냅샷 없음"
 
@@ -3245,7 +3219,7 @@ def format_status_report():
 # [7-C. 강화 자가검증 스위트 (--self-test)]
 # ==========================================
 def run_self_tests():
-    """핵심 수학·결측·보간·채점·파싱 불변식을 오프라인 결정론적으로 검증"""
+    """핵심 수학·결측·보간·채점·파싱·재진입락 불변식을 오프라인 결정론적으로 검증"""
     results = []
 
     def _check(name, cond, detail=""):
@@ -3284,7 +3258,7 @@ def run_self_tests():
         f"06h={df_w_san.loc[pd.Timestamp('2026-01-15 06:00:00'), 'obs_rain']}, 15h={df_w_san.loc[pd.Timestamp('2026-01-15 15:00:00'), 'obs_rain']}"
     )
 
-    # 3) NASA 강수 선형보간 번짐 차단 (12h 간격 단일 0.5mm 스파이크가 23시간 번지지 않음)
+    # 3) NASA 강수 선형보간 번짐 차단
     nasa_times = ["2026-11-26 00:00", "2026-11-26 12:00", "2026-11-27 00:00"]
     df_n_test, _ = _build_nasa_df_from_cell(nasa_times, {"t": [10.0, 12.0, 10.0], "p": [0.0, 0.5, 0.0], "w": [None, None, None]}, step_hours=12)
     wet_pred_h = int((df_n_test["precipitation_probability_nasa_geos_fp"].fillna(0) >= 40.0).sum())
@@ -3341,8 +3315,13 @@ def run_self_tests():
     st_ok = (_match_station_in_question("제주도 성산 날씨 어때?") == "성산")
     _check("AI 날짜·지역 파싱 오인식 차단", d_ok and st_ok, f"date_ok={d_ok}, station_ok={st_ok}")
 
-    # 7) best_match 키의 공식 모델/스냅샷 격리 확인
+    # 7) best_match 키의 공식 모델 격리 확인
     _check("Open-Meteo best_match 공식 모델 격리", EMERGENCY_BEST_MATCH_KEY not in MODELS)
+
+    # 8) RLock 재진입 데드락 방지 확인
+    with _LOCK:
+        _ = _is_kma_down()
+    _check("RLock 중첩 호출 데드락 방지", True)
 
     passed = sum(1 for _, ok, _ in results if ok)
     print(f"=== SELF_TEST_SUMMARY: {passed}/{len(results)} PASSED ===", flush=True)
@@ -3474,7 +3453,6 @@ if "--auto-update" in sys.argv:
     print(f"📋 [배치 헬스 리포트 저장] overall={rep_saved['overall']} → {BATCH_HEALTH_FILE}", flush=True)
     print(f"✅ [무인 스케줄러 {APP_VERSION} 완료] 총 {total_batch_sec:.2f}s (OM {om_sec:.2f}s + NASA {nasa_batch_sec:.2f}s + KMA {kma_sec:.2f}s + 채점 {loop_sec:.2f}s | 스냅샷 {snap_present_cnt}/{total_n}개소)", flush=True)
 
-    # 핵심 수집·저장 실패 또는 관측소 25% 이상 예외 시 비정상 종료 코드(exit 1) 반환 (daily_update.yml if: always()와 연계)
     critical_fail = (
         om_ok == 0
         or asos_ok == 0
@@ -3702,7 +3680,7 @@ with tab_forecast:
         pk24 = _safe_peak_row(df_24h)
 
         if EMERGENCY_BEST_MATCH_KEY in res.get("active_models", {}):
-            st.warning(f"⚠️ 개별 글로벌 모델 응답 실패로 Open-Meteo 통합 비상 예보(`best_match`)를 표시 중입니다. (가중치 학습에는 미반영)")
+            st.warning("⚠️ 개별 글로벌 모델 응답 실패로 Open-Meteo 통합 비상 예보(`best_match`)를 표시 중입니다. (가중치 학습에는 미반영)")
         else:
             if res.get("nasa_loaded"):
                 nasa_badge = f"🛰️ 11대 통합(NASA L{res['nasa_level']} 포함 · {res['nasa_note']})"
@@ -3802,7 +3780,6 @@ with tab_forecast:
                 })
             st.dataframe(pd.DataFrame(rows_7d), width="stretch", hide_index=True)
 
-        # 4. 전일 시간별 검증 이력 & 일별 모델 성적 이력 (최근 14일)
         h_hist_map = res.get("hourly_history", {})
         m_hist_list = res.get("model_history", [])
         with st.expander(f"📜 4. [{selected_region}] 최근 검증 이력 (시간별 실측 대조 · 일별 모델 성적)", expanded=False):
