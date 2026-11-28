@@ -35,8 +35,9 @@ jobs:
           NASA_PASS: ${{ secrets.NASA_PASS }}
         run: |
           echo "KMA_AUTH_KEY length: ${#KMA_AUTH_KEY}"
+          PYTHONUNBUFFERED=1 python -u app.py --self-test
           PYTHONUNBUFFERED=1 python -u app.py --auto-update
-
+          
       - name: 5. 갱신된 장부·스냅샷·임계값·캐시 안전 저장
         if: always()
         run: |
