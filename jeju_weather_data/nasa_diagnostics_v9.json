@@ -1,8 +1,8 @@
 {
   "recommended_level": 3,
-  "consecutive_full_fails": 1,
+  "consecutive_full_fails": 2,
   "consecutive_fast_ok": 0,
-  "last_run_at": "2026-11-28 13:54",
+  "last_run_at": "2026-11-28 14:17",
   "last_status": "실패(ReadTimeout)",
   "last_action": "메타데이터(.das) 접근 실패 → 기존 권장단계 L3 유지",
   "events": [
@@ -158,6 +158,17 @@
       "data_ms": 0,
       "result": "ReadTimeout",
       "detail": "flx_Nx.20261126_12Z DAS ReadTimeout(15s)",
+      "action": "메타데이터(.das) 접근 실패 → 기존 권장단계 L3 유지"
+    },
+    {
+      "time": "2026-11-28 14:17",
+      "level": 3,
+      "run": "-",
+      "files": 0,
+      "das_ms": 48490,
+      "data_ms": 0,
+      "result": "ReadTimeout",
+      "detail": "flx_Nx.20261127_00Z DAS ReadTimeout(15s)",
       "action": "메타데이터(.das) 접근 실패 → 기존 권장단계 L3 유지"
     }
   ]
