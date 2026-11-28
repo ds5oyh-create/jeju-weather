@@ -236,7 +236,7 @@ def _record_kma_conn_failure(reason):
     with _LOCK:
         _RT["kma_conn_fails"] += 1
         _RT["kma_down_reason"] = reason
-        if _RT["kma_conn_fails"] >= 2:
+        if _RT["kma_conn_fails"] >= 4:
             _RT["kma_down_until"] = time.time() + 600.0
             msg = f"연속 연결실패({_RT['kma_conn_fails']}회, {reason}) → 10분 회로차단"
             SYSTEM_HEALTH["api_status"]["KMA ASOS (종관기상관측)"]["status"] = "⛔ 회로차단"
@@ -1096,7 +1096,9 @@ def _build_nasa_df_from_cell(times_iso, cell_dict, step_hours=6):
         df_fc["wind_speed_10m_nasa_geos_fp"] = df_fc["wind_speed_10m_nasa_geos_fp"].interpolate(method="linear", limit=interp_lim).clip(lower=0.0)
     if has_rain:
         s_p_raw = df_fc["precipitation_nasa_geos_fp"].clip(lower=0.0)
-        df_fc["precipitation_nasa_geos_fp"] = s_p_raw.interpolate(method="nearest", limit=1, limit_area="inside")
+        s_p_fwd = s_p_raw.ffill(limit=1)
+        s_p_bwd = s_p_raw.bfill(limit=1)
+        df_fc["precipitation_nasa_geos_fp"] = s_p_fwd.combine_first(s_p_bwd) = s_p_raw.interpolate(method="nearest", limit=1, limit_area="inside")
     df_fc["precipitation_probability_nasa_geos_fp"] = estimate_prob_from_rain(df_fc["precipitation_nasa_geos_fp"])
     return df_fc, has_rain
 
@@ -1761,7 +1763,7 @@ def prefetch_kma_asos_batch(date_str, auth_key):
         }
     return sec, 0, last_reason
 
-def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None, max_retries=2, read_to=12, hard_to=20):
+def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None, max_retries=2, read_to=16, hard_to=22):
     """KMA 실측 수집 (AWS 음수 결측값 -99.9/-9.0을 0.0이 아닌 NaN으로 엄격 격리)"""
     if not auth_key:
         return pd.DataFrame(), "기상청 API 키 미설정 (Secrets에 KMA_AUTH_KEY 등록 필요)", 0.0
@@ -1852,7 +1854,7 @@ def fetch_kma_obs_v8(stn_info, date_str, auth_key, stn_name="", deadline_ts=None
         if deadline_ts is not None and time.monotonic() > deadline_ts:
             fail_reason = "배치상한도달"
             break
-        _kma_rate_wait(0.2)
+        _kma_rate_wait(0.35)
         if _is_kma_down():
             fail_reason = f"회로차단({_get_kma_down_reason()})"
             break
