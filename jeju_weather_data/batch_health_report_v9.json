@@ -1,10 +1,10 @@
 {
-  "version": "v9.7",
-  "completed_at": "2026-11-27 07:38",
+  "version": "v9.8",
+  "completed_at": "2026-11-28 13:57",
   "schedule": "매일 KST 06:42",
   "station_count": 41,
-  "total_sec": 175.1,
-  "overall": "ok",
+  "total_sec": 159.68,
+  "overall": "fail",
   "steps": [
     {
       "step": "1. 관측소 주소록",
@@ -20,45 +20,45 @@
       "level": "ok",
       "status": "✅ 정상",
       "detail": "41/41개소 적재 (전체 일괄 성공)",
-      "latency": "6.11s"
+      "latency": "6.71s"
     },
     {
       "step": "3. NASA 선행캐시",
       "name": "GEOS-FP 적응형 수집",
-      "level": "ok",
-      "status": "✅ 정상(L3 경량)",
-      "detail": "L3 flx_Nx.latest (11/26 19시KST기준, 5파일×12h) · 1/1격자 · 29.17s (L3 정상 수집 (29.0s))",
-      "latency": "29.17s"
+      "level": "fail",
+      "status": "❌ 미수신",
+      "detail": "미수신(flx_Nx.20261126_12Z DAS ReadTimeout(15s))",
+      "latency": "48.60s"
     },
     {
       "step": "4. 기상청 실측",
-      "name": "전일(20261126) ASOS+AWS",
-      "level": "ok",
-      "status": "✅ 정상",
-      "detail": "ASOS 4/4 · AWS 직접 34/37 · 보간동결 3 · 실패 0",
-      "latency": "135.57s"
+      "name": "전일(20261127) ASOS+AWS",
+      "level": "fail",
+      "status": "❌ 실패/차단",
+      "detail": "ASOS 4/4 · AWS 직접 1/37 · 보간동결 36 · 실패 0",
+      "latency": "104.07s"
     },
     {
       "step": "5. 스냅샷 아카이브",
       "name": "당일 예보 스냅샷 저장",
-      "level": "ok",
-      "status": "✅ 정상",
-      "detail": "당일 41/41개소 보관 (신규/병합 0개소)",
+      "level": "fail",
+      "status": "❌ 실패",
+      "detail": "당일 0/41개소 보관 (신규/병합 0개소)",
       "latency": "-"
     },
     {
       "step": "6. 가중치 학습",
       "name": "직접관측 채점 및 고정",
-      "level": "ok",
-      "status": "✅ 정상",
-      "detail": "직접학습 38/41 · 당일갱신 41/41 (예외 0건)",
-      "latency": "4.24s"
+      "level": "fail",
+      "status": "❌ 실패",
+      "detail": "직접학습 0/41 · 당일갱신 0/41 (예외 41건)",
+      "latency": "0.29s"
     },
     {
       "step": "7. 임계값 보정",
-      "name": "4단계 최적 임계값 산출",
-      "level": "ok",
-      "status": "✅ 고정완료",
+      "name": "OOS 4단계 최적 임계값",
+      "level": "warn",
+      "status": "⚠️ 확인필요",
       "detail": "기본값(표본수집중) · 표본 5/7일 · 강수 244h",
       "latency": "-"
     }
